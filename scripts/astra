@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# astra — run one headless ASTRA (Codex, gpt-6-astra) pass and print only its final answer.
+#
+#   astra [-C DIR] [-w] [-m MODEL] "prompt"      prompt as argument
+#   echo "prompt" | astra [-C DIR] [-w]          prompt from stdin
+#   astra review [-C DIR] [--uncommitted|--base BR|--commit SHA] ["focus"]
+#
+#   -C DIR  working root (default: cwd)    -w  allow writes (default read-only)
+#   -m      model override (default from ~/.codex/config.toml = gpt-6-astra)
+# Full transcript goes to .claude/astra-logs/ so Claude's context stays small.
+set -euo pipefail
+DIR="$PWD"; SANDBOX="read-only"; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=()
+[[ "${1:-}" == "review" ]] && { MODE="review"; shift; }
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -C) DIR="$2"; shift 2 ;;
+    -w) SANDBOX="workspace-write"; shift ;;
+    -m) MODEL_ARGS=(-m "$2"); shift 2 ;;
+    --uncommitted) REVIEW_ARGS+=("$1"); shift ;;
+    --base|--commit) REVIEW_ARGS+=("$1" "$2"); shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+DIR="$(cd "$DIR" && pwd -P)"   # absolute, so paths survive the cd in review mode
+PROMPT="${*:-}"
+# Read a piped prompt from stdin (exec mode only). Time out so a caller with an
+# open-but-idle stdin (e.g. an agent harness) never hangs here.
+if [[ -z "$PROMPT" && "$MODE" == "exec" && ! -t 0 ]]; then
+  IFS= read -r -t 3 -d '' PROMPT || true
+fi
+LOG_DIR="${ASTRA_LOG_DIR:-$DIR/.claude/astra-logs}"; mkdir -p "$LOG_DIR"; LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
+STAMP="$(date +%Y%m%d-%H%M%S)-$$"; OUT="$LOG_DIR/$STAMP.last.md"; LOG="$LOG_DIR/$STAMP.log"
+COMMON=(--skip-git-repo-check -o "$OUT")
+[[ ${#MODEL_ARGS[@]} -gt 0 ]] && COMMON+=("${MODEL_ARGS[@]}")
+if [[ "$MODE" == "review" ]]; then
+  # `codex exec review` has no -C/--color; run it from inside the repo instead.
+  # A custom prompt cannot be combined with --uncommitted/--base/--commit, so when a
+  # prompt is given the scope is folded into the prompt text instead.
+  [[ ${#REVIEW_ARGS[@]} -eq 0 ]] && REVIEW_ARGS=(--uncommitted)
+  if [[ -n "$PROMPT" ]]; then
+    case "${REVIEW_ARGS[0]}" in
+      --uncommitted) SCOPE="the uncommitted changes (staged, unstaged and untracked; see git status / git diff HEAD)" ;;
+      --base) SCOPE="the changes on this branch relative to base branch ${REVIEW_ARGS[1]} (git diff ${REVIEW_ARGS[1]}...HEAD)" ;;
+      --commit) SCOPE="the changes introduced by commit ${REVIEW_ARGS[1]} (git show ${REVIEW_ARGS[1]})" ;;
+    esac
+    (cd "$DIR" && codex exec -s "$SANDBOX" review "${COMMON[@]}" "Review $SCOPE. $PROMPT") >"$LOG" 2>&1 || true
+  else
+    (cd "$DIR" && codex exec -s "$SANDBOX" review "${COMMON[@]}" "${REVIEW_ARGS[@]}") >"$LOG" 2>&1 || true
+  fi
+else
+  COMMON+=(-C "$DIR" --color never)
+  [[ -z "$PROMPT" ]] && { echo "astra: no prompt given" >&2; exit 2; }
+  codex exec "${COMMON[@]}" -s "$SANDBOX" - <<<"$PROMPT" >"$LOG" 2>&1 || true
+fi
+if [[ -s "$OUT" ]]; then cat "$OUT"; echo; echo "[astra log: $LOG]"
+else echo "astra: no final message produced. Tail of log:" >&2; tail -40 "$LOG" >&2; exit 1; fi

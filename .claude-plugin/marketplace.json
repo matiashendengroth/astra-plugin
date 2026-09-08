@@ -1,0 +1,16 @@
+{
+  "name": "smarteating",
+  "owner": {
+    "name": "Smarteating"
+  },
+  "plugins": [
+    {
+      "name": "astra",
+      "source": "./",
+      "description": "Claude \u21c4 ASTRA (Codex) multi-agent pipeline"
+    }
+  ],
+  "metadata": {
+    "description": "Smarteating team plugins for Claude Code"
+  }
+}
