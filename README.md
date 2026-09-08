@@ -9,7 +9,7 @@
 ## Install
 In Claude Code:
 ```
-/plugin marketplace add <org>/<this-repo>
+/plugin marketplace add Smart-Lifestyle-AS/astra-plugin
 /plugin install astra@smarteating
 ```
 Then `/astra <task>` in any project. Approve the `scripts/astra` command once when prompted, or add
