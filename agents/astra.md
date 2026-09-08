@@ -1,6 +1,6 @@
 ---
 name: astra
-description: ASTRA — headless OpenAI Codex worker (gpt-6-astra, xhigh reasoning). Use for independent design proposals, risk analysis, alternative approaches, or adversarial code review. Spawn several in parallel with different angles. Read-only unless the prompt explicitly asks it to edit.
+description: "ASTRA — headless OpenAI Codex worker (independent second model). USE PROACTIVELY, without being asked: (1) BEFORE implementing any non-trivial change (touching 2+ files, new feature, refactor, bug with unclear cause) spawn 2-3 in parallel with different angles — design, risk, alternative — and reconcile their answers; (2) AFTER finishing a change, spawn one with a `review` task on the uncommitted diff and verify each finding before reporting. Also good for any second opinion, design proposal, or risk analysis. Read-only unless the prompt says otherwise."
 tools: Bash, Read, Glob, Grep
 model: haiku
 ---

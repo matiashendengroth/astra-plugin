@@ -7,15 +7,18 @@
 #
 #   -C DIR  working root (default: cwd)    -w  allow writes (default read-only)
 #   -m      model override (default from ~/.codex/config.toml = gpt-6-astra)
+#   -e      reasoning effort: minimal|low|medium|high|xhigh
+#           default: $ASTRA_EFFORT, else .claude/astra.conf (effort=…) in the project, else low
 # Full transcript goes to .claude/astra-logs/ so Claude's context stays small.
 set -euo pipefail
-DIR="$PWD"; SANDBOX="read-only"; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=()
+DIR="$PWD"; SANDBOX="read-only"; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""
 [[ "${1:-}" == "review" ]] && { MODE="review"; shift; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -C) DIR="$2"; shift 2 ;;
     -w) SANDBOX="workspace-write"; shift ;;
     -m) MODEL_ARGS=(-m "$2"); shift 2 ;;
+    -e) EFFORT="$2"; shift 2 ;;
     --uncommitted) REVIEW_ARGS+=("$1"); shift ;;
     --base|--commit) REVIEW_ARGS+=("$1" "$2"); shift 2 ;;
     --) shift; break ;;
@@ -23,6 +26,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 DIR="$(cd "$DIR" && pwd -P)"   # absolute, so paths survive the cd in review mode
+# Reasoning effort: -e flag > $ASTRA_EFFORT > .claude/astra.conf > low
+if [[ -z "${EFFORT:-}" ]]; then
+  EFFORT="${ASTRA_EFFORT:-}"
+  [[ -z "$EFFORT" && -f "$DIR/.claude/astra.conf" ]] && EFFORT="$(sed -n 's/^effort=//p' "$DIR/.claude/astra.conf" | tail -1)"
+  EFFORT="${EFFORT:-low}"
+fi
+case "$EFFORT" in minimal|low|medium|high|xhigh) ;; *) echo "astra: bad effort '$EFFORT' (minimal|low|medium|high|xhigh)" >&2; exit 2 ;; esac
 PROMPT="${*:-}"
 # Read a piped prompt from stdin (exec mode only). Time out so a caller with an
 # open-but-idle stdin (e.g. an agent harness) never hangs here.
@@ -31,7 +41,7 @@ if [[ -z "$PROMPT" && "$MODE" == "exec" && ! -t 0 ]]; then
 fi
 LOG_DIR="${ASTRA_LOG_DIR:-$DIR/.claude/astra-logs}"; mkdir -p "$LOG_DIR"; LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"; OUT="$LOG_DIR/$STAMP.last.md"; LOG="$LOG_DIR/$STAMP.log"
-COMMON=(--skip-git-repo-check -o "$OUT")
+COMMON=(--skip-git-repo-check -o "$OUT" -c "model_reasoning_effort=\"$EFFORT\"")
 [[ ${#MODEL_ARGS[@]} -gt 0 ]] && COMMON+=("${MODEL_ARGS[@]}")
 if [[ "$MODE" == "review" ]]; then
   # `codex exec review` has no -C/--color; run it from inside the repo instead.
