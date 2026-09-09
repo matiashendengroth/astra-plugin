@@ -1,67 +1,123 @@
 #!/usr/bin/env bash
-# astra — run one headless ASTRA (Codex, gpt-6-astra) pass and print only its final answer.
+# astra — run one headless ASTRA (OpenAI Codex) pass and print only its final answer.
 #
-#   astra [-C DIR] [-w] [-m MODEL] "prompt"      prompt as argument
-#   echo "prompt" | astra [-C DIR] [-w]          prompt from stdin
-#   astra review [-C DIR] [--uncommitted|--base BR|--commit SHA] ["focus"]
+#   astra [opts] "prompt"                 prompt as argument
+#   echo "prompt" | astra [opts]          prompt from stdin
+#   astra review [opts] [--uncommitted|--base BR|--commit SHA] ["focus"]
 #
-#   -C DIR  working root (default: cwd)    -w  allow writes (default read-only)
-#   -m      model override (default from ~/.codex/config.toml = gpt-6-astra)
-#   -e      reasoning effort: minimal|low|medium|high|xhigh
-#           default: $ASTRA_EFFORT, else .claude/astra.conf (effort=…) in the project, else low
-# Full transcript goes to .claude/astra-logs/ so Claude's context stays small.
-set -euo pipefail
-DIR="$PWD"; SANDBOX="read-only"; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""
+# Options
+#   -C DIR     working root (default: cwd)
+#   -w / --ro  force workspace-write / read-only sandbox
+#              default: read-only for exec, workspace-write for review (so it can run tests)
+#   -m MODEL   model override (default from ~/.codex/config.toml)
+#   -e EFFORT  reasoning effort minimal|low|medium|high|xhigh
+#              default: $ASTRA_EFFORT > .claude/astra.conf effort= > low (exec) / medium (review)
+#              review-specific: $ASTRA_REVIEW_EFFORT > .claude/astra.conf review_effort=
+#   -t SECS    timeout (default $ASTRA_TIMEOUT or 480). Codex is killed and the log tail printed.
+#   --json     review only: return findings as JSON matching scripts/review-schema.json
+#
+# Transcripts go to .claude/astra-logs/ in the project (last 40 kept).
+set -uo pipefail
+
+die() { echo "astra: $*" >&2; exit 2; }
+command -v codex >/dev/null 2>&1 || die "codex CLI not found. Install: npm i -g @openai/codex  then run: codex  (to log in)"
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+DIR="$PWD"; SANDBOX=""; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""; JSON=0
+TIMEOUT="${ASTRA_TIMEOUT:-480}"
+
 [[ "${1:-}" == "review" ]] && { MODE="review"; shift; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -C) DIR="$2"; shift 2 ;;
     -w) SANDBOX="workspace-write"; shift ;;
+    --ro) SANDBOX="read-only"; shift ;;
     -m) MODEL_ARGS=(-m "$2"); shift 2 ;;
     -e) EFFORT="$2"; shift 2 ;;
+    -t) TIMEOUT="$2"; shift 2 ;;
+    --json) JSON=1; shift ;;
     --uncommitted) REVIEW_ARGS+=("$1"); shift ;;
     --base|--commit) REVIEW_ARGS+=("$1" "$2"); shift 2 ;;
     --) shift; break ;;
+    -*) die "unknown option $1" ;;
     *) break ;;
   esac
 done
-DIR="$(cd "$DIR" && pwd -P)"   # absolute, so paths survive the cd in review mode
-# Reasoning effort: -e flag > $ASTRA_EFFORT > .claude/astra.conf > low
-if [[ -z "${EFFORT:-}" ]]; then
-  EFFORT="${ASTRA_EFFORT:-}"
-  [[ -z "$EFFORT" && -f "$DIR/.claude/astra.conf" ]] && EFFORT="$(sed -n 's/^effort=//p' "$DIR/.claude/astra.conf" | tail -1)"
-  EFFORT="${EFFORT:-low}"
+[[ -d "$DIR" ]] || die "no such directory: $DIR"
+DIR="$(cd "$DIR" && pwd -P)"
+CONF="$DIR/.claude/astra.conf"
+conf() { [[ -f "$CONF" ]] && sed -n "s/^$1=//p" "$CONF" | tail -1; }
+
+# sandbox default per mode
+if [[ -z "$SANDBOX" ]]; then
+  if [[ "$MODE" == "review" ]]; then SANDBOX="${ASTRA_REVIEW_SANDBOX:-$(conf review_sandbox)}"; SANDBOX="${SANDBOX:-workspace-write}"
+  else SANDBOX="read-only"; fi
 fi
-case "$EFFORT" in minimal|low|medium|high|xhigh) ;; *) echo "astra: bad effort '$EFFORT' (minimal|low|medium|high|xhigh)" >&2; exit 2 ;; esac
+
+# effort: flag > env > conf > default (review has its own chain, falling back to the general one)
+if [[ -z "$EFFORT" ]]; then
+  if [[ "$MODE" == "review" ]]; then EFFORT="${ASTRA_REVIEW_EFFORT:-$(conf review_effort)}"; fi
+  [[ -z "$EFFORT" ]] && EFFORT="${ASTRA_EFFORT:-$(conf effort)}"
+  [[ -z "$EFFORT" ]] && { [[ "$MODE" == "review" ]] && EFFORT="medium" || EFFORT="low"; }
+fi
+case "$EFFORT" in minimal|low|medium|high|xhigh) ;; *) die "bad effort '$EFFORT' (minimal|low|medium|high|xhigh)" ;; esac
+[[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "bad timeout '$TIMEOUT'"
+
 PROMPT="${*:-}"
-# Read a piped prompt from stdin (exec mode only). Time out so a caller with an
-# open-but-idle stdin (e.g. an agent harness) never hangs here.
-if [[ -z "$PROMPT" && "$MODE" == "exec" && ! -t 0 ]]; then
-  IFS= read -r -t 3 -d '' PROMPT || true
-fi
+if [[ -z "$PROMPT" && "$MODE" == "exec" && ! -t 0 ]]; then IFS= read -r -t 3 -d '' PROMPT || true; fi
+[[ "$MODE" == "exec" && -z "$PROMPT" ]] && die "no prompt given"
+
 LOG_DIR="${ASTRA_LOG_DIR:-$DIR/.claude/astra-logs}"; mkdir -p "$LOG_DIR"; LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
+ls -t "$LOG_DIR" 2>/dev/null | tail -n +81 | while read -r f; do rm -f "$LOG_DIR/$f"; done   # keep last 40 runs (log+last)
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"; OUT="$LOG_DIR/$STAMP.last.md"; LOG="$LOG_DIR/$STAMP.log"
+
 COMMON=(--skip-git-repo-check -o "$OUT" -c "model_reasoning_effort=\"$EFFORT\"")
 [[ ${#MODEL_ARGS[@]} -gt 0 ]] && COMMON+=("${MODEL_ARGS[@]}")
+
 if [[ "$MODE" == "review" ]]; then
-  # `codex exec review` has no -C/--color; run it from inside the repo instead.
-  # A custom prompt cannot be combined with --uncommitted/--base/--commit, so when a
-  # prompt is given the scope is folded into the prompt text instead.
+  [[ $JSON -eq 1 ]] && COMMON+=(--output-schema "$HERE/review-schema.json")
   [[ ${#REVIEW_ARGS[@]} -eq 0 ]] && REVIEW_ARGS=(--uncommitted)
-  if [[ -n "$PROMPT" ]]; then
+  if [[ -n "$PROMPT" || $JSON -eq 1 ]]; then
+    # a custom prompt cannot be combined with scope flags; fold the scope into the text
     case "${REVIEW_ARGS[0]}" in
       --uncommitted) SCOPE="the uncommitted changes (staged, unstaged and untracked; see git status / git diff HEAD)" ;;
       --base) SCOPE="the changes on this branch relative to base branch ${REVIEW_ARGS[1]} (git diff ${REVIEW_ARGS[1]}...HEAD)" ;;
       --commit) SCOPE="the changes introduced by commit ${REVIEW_ARGS[1]} (git show ${REVIEW_ARGS[1]})" ;;
     esac
-    (cd "$DIR" && codex exec -s "$SANDBOX" review "${COMMON[@]}" "Review $SCOPE. $PROMPT") >"$LOG" 2>&1 || true
+    SCOPE="$SCOPE. Ignore .claude/astra-logs/"
+    [[ "$SANDBOX" != "read-only" ]] && SCOPE="$SCOPE. You may run the project's tests/build to verify"
+    TEXT="Review $SCOPE. ${PROMPT:-Be adversarial: bugs, regressions, missed edge cases. Rank by severity.}"
+    if [[ $JSON -eq 1 ]]; then
+      # `codex exec review` ignores --output-schema, so structured reviews go through plain exec.
+      TEXT="You are doing an adversarial code review. $TEXT Report concrete problems with file and line: logic errors, regressions, and edge cases that would crash or return wrong results (empty inputs, missing keys, None, division by zero, off-by-one) even if no current caller triggers them. Do not report style or speculation. An empty findings array is correct when there is nothing concrete."
+      CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" "$TEXT")
+    else
+      CMD=(codex exec -s "$SANDBOX" review "${COMMON[@]}" "$TEXT")
+    fi
   else
-    (cd "$DIR" && codex exec -s "$SANDBOX" review "${COMMON[@]}" "${REVIEW_ARGS[@]}") >"$LOG" 2>&1 || true
+    CMD=(codex exec -s "$SANDBOX" review "${COMMON[@]}" "${REVIEW_ARGS[@]}")
   fi
+  (cd "$DIR" && "${CMD[@]}") >"$LOG" 2>&1 </dev/null &
 else
-  COMMON+=(-C "$DIR" --color never)
-  [[ -z "$PROMPT" ]] && { echo "astra: no prompt given" >&2; exit 2; }
-  codex exec "${COMMON[@]}" -s "$SANDBOX" - <<<"$PROMPT" >"$LOG" 2>&1 || true
+  CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" -)
+  "${CMD[@]}" <<<"$PROMPT" >"$LOG" 2>&1 &
 fi
-if [[ -s "$OUT" ]]; then cat "$OUT"; echo; echo "[astra log: $LOG]"
-else echo "astra: no final message produced. Tail of log:" >&2; tail -40 "$LOG" >&2; exit 1; fi
+PID=$!
+
+# portable timeout (macOS has no coreutils timeout)
+ELAPSED=0
+while kill -0 "$PID" 2>/dev/null; do
+  if (( ELAPSED >= TIMEOUT )); then
+    kill "$PID" 2>/dev/null; sleep 1; kill -9 "$PID" 2>/dev/null
+    echo "astra: timed out after ${TIMEOUT}s (effort=$EFFORT). Log tail:" >&2; tail -30 "$LOG" >&2
+    echo "[astra log: $LOG]" >&2; exit 124
+  fi
+  sleep 1; ELAPSED=$((ELAPSED+1))
+done
+wait "$PID"; RC=$?
+
+if [[ -s "$OUT" ]]; then
+  cat "$OUT"; echo; echo "[astra log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
+else
+  echo "astra: no final message produced (exit $RC). Log tail:" >&2; tail -40 "$LOG" >&2; exit 1
+fi

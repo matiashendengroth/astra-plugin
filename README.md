@@ -1,28 +1,32 @@
 # astra — Claude ⇄ Codex pipeline plugin
 
-`/astra <task>` runs: Claude architect → 3 parallel ASTRA (Codex) passes → Claude reconcile + implement → ASTRA adversarial review → Claude verify.
+ASTRA = OpenAI Codex used as an independent second model around Claude Code.
+`/astra <task>` runs: Claude architect → parallel ASTRA passes (scaled to task size) → Claude reconcile + implement → ASTRA adversarial review (JSON findings, can run tests) → Claude verify.
 
-## Prerequisites (each teammate)
-1. `npm i -g @openai/codex` and run `codex` once to log in.
-2. Optional: set the model in `~/.codex/config.toml`, e.g. `model = "gpt-6-astra"`, `model_reasoning_effort = "xhigh"`.
+## Prerequisites (each person)
+1. `npm i -g @openai/codex` then run `codex` once to log in.
+2. Optional, in `~/.codex/config.toml`: `model = "gpt-6-astra"`.
 
 ## Install
-In Claude Code:
 ```
 /plugin marketplace add matiashendengroth/astra-plugin
-/plugin install astra@smarteating
+/plugin install astra@matias
 ```
-Then `/astra <task>` in any project. Approve the `scripts/astra` command once when prompted, or add
-`"Bash(*/astra-plugin/scripts/astra:*)"` style allow rule to your settings.
+Update later with `/plugin update astra`.
 
-## Automatic use (no manual `/astra`)
-Run `/astra-auto` once in a project. It adds a rule to `CLAUDE.md` so Claude spawns `astra` subagents on its own:
-design/risk/alternative passes before non-trivial changes, and an adversarial review after. `/astra-auto off` removes it.
-The subagent description also marks it "use proactively", so Claude may reach for it even without the rule.
+## Automatic use (recommended)
+In a project run `/astra-auto` once. It adds a rule to `CLAUDE.md` so Claude calls ASTRA on its own (risk pass before medium changes, design/risk/alternative before large ones, adversarial review after), adds the permission rule so there are no prompts, and gitignores the logs. `/astra-auto off` reverses it. `/astra <task>` still forces the full pipeline.
 
 ## Reasoning effort
-Default is `low`. Change it per project with `/astra-effort <minimal|low|medium|high|xhigh>` (stored in `.claude/astra.conf`),
-per shell with `ASTRA_EFFORT=high`, or per call with `astra -e high "..."`.
+| what | default | override |
+|---|---|---|
+| exec passes | low | `-e`, `ASTRA_EFFORT`, `effort=` in `.claude/astra.conf` |
+| review | medium | `-e`, `ASTRA_REVIEW_EFFORT`, `review_effort=` in `.claude/astra.conf` |
 
-## Logs
-Full Codex transcripts go to `.claude/astra-logs/` in the project (add to `.gitignore`).
+`/astra-effort <level>` sets `effort=`; `/astra-effort review <level>` sets `review_effort=`.
+
+## Wrapper
+`scripts/astra` — see the header for all options. Highlights: `-t SECS` timeout (default 480), `--json` structured review, `--ro`/`-w` sandbox override. Review defaults to workspace-write so Codex can run the test suite; set `review_sandbox=read-only` in `.claude/astra.conf` or `ASTRA_REVIEW_SANDBOX=read-only` to forbid that.
+
+## Test
+`scripts/test.sh` runs a smoke suite against a temp repo (needs a logged-in codex; ~3–5 min).

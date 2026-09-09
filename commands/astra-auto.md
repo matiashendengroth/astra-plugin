@@ -1,23 +1,30 @@
 ---
-description: Toggle automatic ASTRA delegation in this project (adds/removes a rule in CLAUDE.md) — /astra-auto [on|off]
+description: Toggle automatic ASTRA delegation in this project (CLAUDE.md rule + permission + gitignore) — /astra-auto [on|off]
 argument-hint: "[on|off]"
 ---
 Toggle automatic ASTRA delegation for the current project: **${ARGUMENTS:-on}**.
 
-The rule block is delimited by the lines `<!-- astra-auto:start -->` and `<!-- astra-auto:end -->` in `./CLAUDE.md`.
+The absolute wrapper path is `${CLAUDE_PLUGIN_ROOT}/scripts/astra` — write it out literally in everything below (CLAUDE.md cannot expand variables).
 
-- **on**: if the block is absent, append this to `./CLAUDE.md` (create the file if needed):
+The CLAUDE.md rule block is delimited by `<!-- astra-auto:start -->` and `<!-- astra-auto:end -->`.
+
+## on
+1. If the block is absent, append this to `./CLAUDE.md` (create if needed), substituting the real path for WRAPPER:
 
 ```
 <!-- astra-auto:start -->
 ## ASTRA delegation (automatic)
-Use the `astra` subagent proactively; do not wait to be asked.
-- Before any non-trivial change (2+ files, new feature, refactor, unclear bug): spawn 2–3 `astra` subagents in parallel (design / risk / alternative), reconcile, then implement.
-- After finishing a change: spawn one `astra` subagent to run `review` on the uncommitted diff. Confirm or refute each finding against the code before reporting.
-- Trivial edits (typos, one-liners, config tweaks) skip ASTRA.
+ASTRA is an independent second model (OpenAI Codex). Wrapper: `WRAPPER`. Call it with Bash as a background job (timeout 600000), always with `-C "<absolute project dir>"`. Use it proactively; do not wait to be asked.
+- Before a **medium** change (2–4 files): one ASTRA pass — risk analysis of the plan. Before a **large** change (new feature, refactor, cross-cutting, unclear bug): three parallel passes — design, risk, alternative. Reconcile, then implement. Trivial edits skip this.
+- After finishing any non-trivial change: `WRAPPER review -C "<dir>" --uncommitted --json`. Confirm or refute each finding against the code before reporting; fix confirmed ones.
+- Long prompts: write to a scratch file and pipe them in.
 <!-- astra-auto:end -->
 ```
 
-- **off**: remove that block (and nothing else) from `./CLAUDE.md`.
+2. Permission: add `"Bash(WRAPPER:*)"` to `permissions.allow` in `./.claude/settings.local.json` (create the file / arrays if missing, keep everything else, valid JSON).
+3. Add `.claude/astra-logs/` to `./.gitignore` if not present.
 
-Confirm in one line what you did. Mention that the change takes effect in new sessions.
+## off
+Remove the CLAUDE.md block (nothing else), remove the allow entry from `./.claude/settings.local.json`, leave `.gitignore` alone.
+
+Confirm in one line what changed. Takes effect in new sessions.

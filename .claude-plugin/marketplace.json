@@ -1,7 +1,7 @@
 {
-  "name": "smarteating",
+  "name": "matias",
   "owner": {
-    "name": "Smarteating"
+    "name": "Matias Henden"
   },
   "plugins": [
     {
@@ -11,6 +11,6 @@
     }
   ],
   "metadata": {
-    "description": "Smarteating team plugins for Claude Code"
+    "description": "Matias Henden's Claude Code plugins"
   }
 }

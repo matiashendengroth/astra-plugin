@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings"],
+  "properties": {
+    "summary": { "type": "string", "description": "One or two sentences on overall state of the change." },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "title", "file", "line", "detail", "suggested_fix"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] },
+          "title": { "type": "string" },
+          "file": { "type": "string", "description": "Path relative to the repo root." },
+          "line": { "type": "integer", "description": "1-based line number, 0 if not applicable." },
+          "detail": { "type": "string", "description": "Concrete failure scenario: inputs/state -> wrong behaviour." },
+          "suggested_fix": { "type": "string" }
+        }
+      }
+    }
+  }
+}
