@@ -15,15 +15,20 @@ ASTRA = OpenAI Codex used as an independent second model around Claude Code.
 Update later with `/plugin update astra`.
 
 ## Automatic use (recommended)
-In a project run `/astra-auto` once. It adds a rule to `CLAUDE.md` so Claude calls ASTRA on its own (risk pass before medium changes, design/risk/alternative before large ones, adversarial review after), adds the permission rule so there are no prompts, and gitignores the logs. `/astra-auto off` reverses it. `/astra <task>` still forces the full pipeline.
+In a project run `/astra-auto` once. It adds a rule to `CLAUDE.md` making Claude the orchestrator and ASTRA the builder: Claude classifies each task, writes specs, runs `astra build` (in parallel git worktrees for large tasks), merges, tests, has ASTRA review the diff, and verifies every finding. Trivial edits stay with Claude. It also adds the permission rule and gitignores the logs. `/astra-auto off` reverses it.
+
+Manual overrides: `/astra-build <task>` forces the build flow; `/astra <task>` forces the advisory flow (Claude writes the code, ASTRA advises and reviews).
 
 ## Reasoning effort
 | what | default | override |
 |---|---|---|
 | exec passes | low | `-e`, `ASTRA_EFFORT`, `effort=` in `.claude/astra.conf` |
 | review | medium | `-e`, `ASTRA_REVIEW_EFFORT`, `review_effort=` in `.claude/astra.conf` |
+| build | high | `-e`, `ASTRA_BUILD_EFFORT`, `build_effort=` in `.claude/astra.conf` |
 
-`/astra-effort <level>` sets `effort=`; `/astra-effort review <level>` sets `review_effort=`.
+Build timeout defaults to 1200 s (`ASTRA_BUILD_TIMEOUT`, `build_timeout=`); everything else 480 s.
+
+`/astra-effort <level>` sets `effort=`; `/astra-effort review|build <level>` sets the mode-specific key.
 
 ## Wrapper
 `scripts/astra` — see the header for all options. Highlights: `-t SECS` timeout (default 480), `--json` structured review, `--ro`/`-w` sandbox override. Review defaults to workspace-write so Codex can run the test suite; set `review_sandbox=read-only` in `.claude/astra.conf` or `ASTRA_REVIEW_SANDBOX=read-only` to forbid that.

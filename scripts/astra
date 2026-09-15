@@ -4,6 +4,8 @@
 #   astra [opts] "prompt"                 prompt as argument
 #   echo "prompt" | astra [opts]          prompt from stdin
 #   astra review [opts] [--uncommitted|--base BR|--commit SHA] ["focus"]
+#   astra build [opts] "spec"             implement a spec in DIR (workspace-write, effort default high,
+#                                         timeout default 1200). Prints what it changed.
 #
 # Options
 #   -C DIR     working root (default: cwd)
@@ -11,9 +13,9 @@
 #              default: read-only for exec, workspace-write for review (so it can run tests)
 #   -m MODEL   model override (default from ~/.codex/config.toml)
 #   -e EFFORT  reasoning effort minimal|low|medium|high|xhigh
-#              default: $ASTRA_EFFORT > .claude/astra.conf effort= > low (exec) / medium (review)
-#              review-specific: $ASTRA_REVIEW_EFFORT > .claude/astra.conf review_effort=
-#   -t SECS    timeout (default $ASTRA_TIMEOUT or 480). Codex is killed and the log tail printed.
+#              default: $ASTRA_EFFORT > .claude/astra.conf effort= > low (exec) / medium (review) / high (build)
+#              mode-specific: $ASTRA_REVIEW_EFFORT / $ASTRA_BUILD_EFFORT, review_effort= / build_effort=
+#   -t SECS    timeout (default $ASTRA_TIMEOUT or 480; build: $ASTRA_BUILD_TIMEOUT or 1200).
 #   --json     review only: return findings as JSON matching scripts/review-schema.json
 #
 # Transcripts go to .claude/astra-logs/ in the project (last 40 kept).
@@ -24,9 +26,9 @@ command -v codex >/dev/null 2>&1 || die "codex CLI not found. Install: npm i -g 
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DIR="$PWD"; SANDBOX=""; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""; JSON=0
-TIMEOUT="${ASTRA_TIMEOUT:-480}"
+TIMEOUT=""
 
-[[ "${1:-}" == "review" ]] && { MODE="review"; shift; }
+case "${1:-}" in review|build) MODE="$1"; shift ;; esac
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -C) DIR="$2"; shift 2 ;;
@@ -51,21 +53,28 @@ conf() { [[ -f "$CONF" ]] && sed -n "s/^$1=//p" "$CONF" | tail -1; }
 # sandbox default per mode
 if [[ -z "$SANDBOX" ]]; then
   if [[ "$MODE" == "review" ]]; then SANDBOX="${ASTRA_REVIEW_SANDBOX:-$(conf review_sandbox)}"; SANDBOX="${SANDBOX:-workspace-write}"
+  elif [[ "$MODE" == "build" ]]; then SANDBOX="workspace-write"
   else SANDBOX="read-only"; fi
+fi
+if [[ -z "$TIMEOUT" ]]; then
+  [[ "$MODE" == "build" ]] && TIMEOUT="${ASTRA_BUILD_TIMEOUT:-$(conf build_timeout)}"
+  [[ -z "$TIMEOUT" ]] && TIMEOUT="${ASTRA_TIMEOUT:-$(conf timeout)}"
+  TIMEOUT="${TIMEOUT:-480}"
 fi
 
 # effort: flag > env > conf > default (review has its own chain, falling back to the general one)
 if [[ -z "$EFFORT" ]]; then
   if [[ "$MODE" == "review" ]]; then EFFORT="${ASTRA_REVIEW_EFFORT:-$(conf review_effort)}"; fi
+  if [[ "$MODE" == "build" ]]; then EFFORT="${ASTRA_BUILD_EFFORT:-$(conf build_effort)}"; fi
   [[ -z "$EFFORT" ]] && EFFORT="${ASTRA_EFFORT:-$(conf effort)}"
-  [[ -z "$EFFORT" ]] && { [[ "$MODE" == "review" ]] && EFFORT="medium" || EFFORT="low"; }
+  if [[ -z "$EFFORT" ]]; then case "$MODE" in review) EFFORT=medium ;; build) EFFORT=high ;; *) EFFORT=low ;; esac; fi
 fi
 case "$EFFORT" in minimal|low|medium|high|xhigh) ;; *) die "bad effort '$EFFORT' (minimal|low|medium|high|xhigh)" ;; esac
 [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "bad timeout '$TIMEOUT'"
 
 PROMPT="${*:-}"
-if [[ -z "$PROMPT" && "$MODE" == "exec" && ! -t 0 ]]; then IFS= read -r -t 3 -d '' PROMPT || true; fi
-[[ "$MODE" == "exec" && -z "$PROMPT" ]] && die "no prompt given"
+if [[ -z "$PROMPT" && "$MODE" != "review" && ! -t 0 ]]; then IFS= read -r -t 3 -d '' PROMPT || true; fi
+[[ "$MODE" != "review" && -z "$PROMPT" ]] && die "no prompt given"
 
 LOG_DIR="${ASTRA_LOG_DIR:-$DIR/.claude/astra-logs}"; mkdir -p "$LOG_DIR"; LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
 ls -t "$LOG_DIR" 2>/dev/null | tail -n +81 | while read -r f; do rm -f "$LOG_DIR/$f"; done   # keep last 40 runs (log+last)
@@ -98,6 +107,13 @@ if [[ "$MODE" == "review" ]]; then
     CMD=(codex exec -s "$SANDBOX" review "${COMMON[@]}" "${REVIEW_ARGS[@]}")
   fi
   (cd "$DIR" && "${CMD[@]}") >"$LOG" 2>&1 </dev/null &
+elif [[ "$MODE" == "build" ]]; then
+  TEXT="You are implementing a change in this repository. Work only inside $DIR. Do not commit, do not touch .git, do not create branches. Follow the spec exactly; if something is ambiguous choose the simplest reasonable option and state the assumption. Run the project's tests/build if they exist and fix failures you introduced. Finish with a short report: files changed (with one line each on what and why), commands you ran and their result, assumptions made, anything left undone.
+
+SPEC:
+$PROMPT"
+  CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" -)
+  "${CMD[@]}" <<<"$TEXT" >"$LOG" 2>&1 &
 else
   CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" -)
   "${CMD[@]}" <<<"$PROMPT" >"$LOG" 2>&1 &
