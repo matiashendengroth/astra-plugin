@@ -15,7 +15,7 @@ ASTRA = OpenAI Codex used as an independent second model around Claude Code.
 Update later with `/plugin update astra`.
 
 ## Automatic use (recommended)
-In a project run `/astra-auto` once. It adds a rule to `CLAUDE.md` making Claude the orchestrator and ASTRA the builder: Claude classifies each task, writes specs, runs `astra build` (in parallel git worktrees for large tasks), merges, tests, has ASTRA review the diff, and verifies every finding. Trivial edits stay with Claude. It also adds the permission rule and gitignores the logs. `/astra-auto off` reverses it.
+In a project run `/astra-auto` once. It adds a rule to `CLAUDE.md` making Claude the orchestrator and ASTRA the builder: Claude classifies each task, writes specs, runs `astra build` (in parallel git worktrees for large tasks), merges, tests, has ASTRA review the diff, and verifies every finding. Trivial edits stay with Claude. It also installs a stable launcher at `~/.local/bin/astra` (which resolves the newest installed plugin version, so plugin updates need no re-run), adds the permission rule, and gitignores the logs. `/astra-auto off` reverses it.
 
 Manual overrides: `/astra-build <task>` forces the build flow; `/astra <task>` forces the advisory flow (Claude writes the code, ASTRA advises and reviews).
 

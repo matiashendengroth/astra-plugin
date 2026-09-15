@@ -4,7 +4,10 @@ argument-hint: "[on|off]"
 ---
 Toggle automatic ASTRA delegation for the current project: **${ARGUMENTS:-on}**.
 
-The absolute wrapper path is `${CLAUDE_PLUGIN_ROOT}/scripts/astra` — write it out literally in everything below (CLAUDE.md cannot expand variables).
+WRAPPER is the stable launcher path `$HOME/.local/bin/astra` — write it out literally (expanded, e.g. `/Users/name/.local/bin/astra`) in everything below. Never write the versioned plugin cache path; it changes on every plugin update.
+
+## 0 · Launcher (both on and off)
+Run: `mkdir -p "$HOME/.local/bin" && cp "${CLAUDE_PLUGIN_ROOT}/scripts/astra-launcher" "$HOME/.local/bin/astra" && chmod +x "$HOME/.local/bin/astra"`. It finds the newest installed plugin version at call time. Then run `"$HOME/.local/bin/astra" --help 2>&1 | head -1` once to confirm it resolves; if it prints "no installed astra plugin", stop and tell the user.
 
 The CLAUDE.md rule block is delimited by `<!-- astra-auto:start -->` and `<!-- astra-auto:end -->`.
 
@@ -26,10 +29,13 @@ You are the orchestrator; ASTRA is the builder. Classify every task first:
 <!-- astra-auto:end -->
 ```
 
-2. Permission: add `"Bash(WRAPPER:*)"` to `permissions.allow` in `./.claude/settings.local.json` (create the file / arrays if missing, keep everything else, valid JSON).
+2. Permission: add `"Bash(WRAPPER:*)"` to `permissions.allow` in `./.claude/settings.local.json` (create the file / arrays if missing, keep everything else, valid JSON). If an older entry pointing at a `plugins/cache/.../scripts/astra` path exists, remove it.
 3. Add `.claude/astra-logs/` and `.astra-wt/` to `./.gitignore` if not present.
 
 ## off
-Remove the CLAUDE.md block (nothing else), remove the allow entry from `./.claude/settings.local.json`, leave `.gitignore` alone.
+Remove the CLAUDE.md block (nothing else), remove the astra allow entries from `./.claude/settings.local.json`, leave `.gitignore` and the launcher alone.
+
+## on, when the block already exists
+Replace the block in place (it may reference an old versioned path) and fix the permission entry as in step 2. Say that it was refreshed.
 
 Confirm in one line what changed. Takes effect in new sessions.
