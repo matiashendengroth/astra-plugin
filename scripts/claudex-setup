@@ -9,13 +9,17 @@ DIR="${1:?usage: claudex-setup <project-dir> [on|off]}"; ACTION="${2:-on}"
 [[ -d "$DIR" ]] || { echo "claudex-setup: no such directory: $DIR" >&2; exit 2; }
 DIR="$(cd "$DIR" && pwd -P)"
 LAUNCHER="$HOME/.local/bin/claudex"
+# python: 'python3' on macOS/Linux, usually just 'python' on Windows (Git Bash)
+PY="$(command -v python3 || command -v python || true)"
+[[ -n "$PY" ]] || { echo "claudex-setup: python 3 not found (needed to edit JSON settings). Install from python.org or 'winget install Python.Python.3'" >&2; exit 2; }
+"$PY" -c 'import sys; sys.exit(0 if sys.version_info[0]==3 else 1)' || { echo "claudex-setup: $PY is not Python 3" >&2; exit 2; }
 CLAUDE_MD="$DIR/CLAUDE.md"; SETTINGS="$DIR/.claude/settings.local.json"; IGNORE="$DIR/.gitignore"
 START='<!-- claudex-auto:start -->'; END='<!-- claudex-auto:end -->'
 LEGACY_START='<!-- astra-auto:start -->'; LEGACY_END='<!-- astra-auto:end -->'
 
 strip_block() {  # remove existing (and legacy astra-named) block from CLAUDE.md if present
   [[ -f "$CLAUDE_MD" ]] || return 0
-  python3 - "$CLAUDE_MD" "$START" "$END" "$LEGACY_START" "$LEGACY_END" <<'PY'
+  "$PY" - "$CLAUDE_MD" "$START" "$END" "$LEGACY_START" "$LEGACY_END" <<'PY'
 import re,sys; p,a,b,la,lb=sys.argv[1:]; s=open(p).read()
 for x,y in ((a,b),(la,lb)):
     s=re.sub(r'\n*'+re.escape(x)+r'.*?'+re.escape(y)+r'\n?', '\n', s, flags=re.S)
@@ -26,7 +30,7 @@ PY
 }
 edit_perms() {  # $1 = add|remove
   mkdir -p "$(dirname "$SETTINGS")"
-  python3 - "$SETTINGS" "$LAUNCHER" "$1" <<'PY'
+  "$PY" - "$SETTINGS" "$LAUNCHER" "$1" <<'PY'
 import json,os,sys; p,l,op=sys.argv[1:]
 s=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
 a=s.setdefault("permissions",{}).setdefault("allow",[])

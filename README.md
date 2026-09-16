@@ -15,9 +15,16 @@ Each CLAUDEX run appears as a named agent in Claude Code, and its full Codex tra
 
 ## Requirements
 
-- Claude Code (desktop or terminal), macOS or Linux. Windows via Git Bash is untested.
+- Claude Code (desktop or terminal) on macOS, Linux, or Windows.
 - [OpenAI Codex CLI](https://github.com/openai/codex): `npm i -g @openai/codex`, then run `codex` once to sign in.
-- `git`, `python3`.
+- `git`, Python 3 (`python3` on macOS/Linux; `python` on Windows is fine).
+
+### Windows notes
+Claude Code runs bash commands through Git Bash, which the scripts target. Make sure:
+- Git for Windows is installed (it ships Git Bash and `awk`, `sed`, `sort`).
+- Python 3 is on PATH: `winget install Python.Python.3`.
+- Codex is installed the same way: `npm i -g @openai/codex`, then `codex` to sign in.
+The launcher installs to `%USERPROFILE%\.local\bin\claudex` and is invoked by its Git Bash path (`/c/Users/<you>/.local/bin/claudex`). Line endings are pinned to LF via `.gitattributes`, so a checkout with `core.autocrlf=true` still works.
 
 ## Install
 

@@ -51,7 +51,7 @@ done
 [[ -d "$DIR" ]] || die "no such directory: $DIR"
 DIR="$(cd "$DIR" && pwd -P)"
 CONF="$DIR/.claude/claudex.conf"
-conf() { [[ -f "$CONF" ]] && sed -n "s/^$1=//p" "$CONF" | tail -1; }
+conf() { [[ -f "$CONF" ]] && sed -n "s/^$1=//p" "$CONF" | tr -d '\r' | tail -1; }
 
 # sandbox default per mode
 if [[ -z "$SANDBOX" ]]; then
@@ -139,7 +139,7 @@ if [[ -s "$OUT" ]]; then
   if [[ $VERBOSE -eq 1 ]]; then
     echo "===== CLAUDEX TRANSCRIPT ($MODE, effort=$EFFORT) ====="
     # print the transcript up to the token count; codex repeats the final answer after it
-    awk '/^tokens used$/{exit} {print}' "$LOG"
+    tr -d '\r' < "$LOG" | awk '/^tokens used$/{exit} {print}'
     echo "===== CLAUDEX FINAL ANSWER ====="
   fi
   cat "$OUT"; echo; echo "[claudex log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
