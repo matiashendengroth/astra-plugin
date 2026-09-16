@@ -4,6 +4,8 @@
 #   claudex [opts] "prompt"                 prompt as argument
 #   echo "prompt" | claudex [opts]          prompt from stdin
 #   claudex review [opts] [--uncommitted|--base BR|--commit SHA] ["focus"]
+#   claudex status [-C DIR]               running/recent runs and build worktrees
+#   claudex cancel [-C DIR] [--keep-worktrees]   stop everything, clean up worktrees
 #   claudex build [opts] "spec"             implement a spec in DIR (workspace-write, effort default high,
 #                                         timeout default 1200). Prints what it changed.
 #
@@ -30,7 +32,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DIR="$PWD"; SANDBOX=""; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""; JSON=0; VERBOSE=0
 TIMEOUT=""
 
-case "${1:-}" in review|build) MODE="$1"; shift ;; esac
+case "${1:-}" in
+  review|build) MODE="$1"; shift ;;
+  status|cancel)  # delegate to the runs tool; accepts -C DIR and, for cancel, --keep-worktrees
+    SUB="$1"; shift; SDIR="$PWD"; EXTRA=()
+    while [[ $# -gt 0 ]]; do case "$1" in -C) SDIR="$2"; shift 2 ;; *) EXTRA+=("$1"); shift ;; esac; done
+    PY="$(command -v python3 || command -v python)"; [[ -n "$PY" ]] || die "python 3 required for $SUB"
+    exec "$PY" "$HERE/claudex-runs.py" "$SUB" "$SDIR" "${EXTRA[@]+"${EXTRA[@]}"}" ;;
+esac
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -C) DIR="$2"; shift 2 ;;
@@ -83,6 +92,20 @@ LOG_DIR="${CLAUDEX_LOG_DIR:-$DIR/.claude/claudex-logs}"; mkdir -p "$LOG_DIR"; LO
 ls -t "$LOG_DIR" 2>/dev/null | tail -n +81 | while read -r f; do rm -f "$LOG_DIR/$f"; done   # keep last 40 runs (log+last)
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"; OUT="$LOG_DIR/$STAMP.last.md"; LOG="$LOG_DIR/$STAMP.log"
 
+# Run registry: one JSON line per event in the MAIN repo (so builders in worktrees are visible
+# together). Status/cancel read this. ROOT = main worktree of the repo containing DIR, else DIR.
+ROOT="$DIR"
+if GCD="$(git -C "$DIR" rev-parse --git-common-dir 2>/dev/null)"; then
+  [[ "$GCD" != /* ]] && GCD="$DIR/$GCD"; ROOT="$(cd "$(dirname "$GCD")" && pwd -P)"
+fi
+RUNS="$ROOT/.claude/claudex-logs/runs.jsonl"; mkdir -p "$(dirname "$RUNS")"
+jesc() { printf '%s' "$1" | tr -d '\r' | sed 's/\\/\\\\/g; s/"/\\"/g' | head -c 160; }
+TITLE="$(jesc "$(printf '%s' "${PROMPT:-review}" | head -1)")"
+record() {  # record <status> [extra json fields]
+  printf '{"id":"%s","ts":%s,"status":"%s","mode":"%s","effort":"%s","sandbox":"%s","dir":"%s","log":"%s","wpid":%s,"pid":%s,"title":"%s"%s}\n' \
+    "$STAMP" "$(date +%s)" "$1" "$MODE" "$EFFORT" "$SANDBOX" "$(jesc "$DIR")" "$(jesc "$LOG")" "$$" "${PID:-0}" "$TITLE" "${2:-}" >> "$RUNS"
+}
+
 COMMON=(--skip-git-repo-check -o "$OUT" -c "model_reasoning_effort=\"$EFFORT\"")
 [[ ${#MODEL_ARGS[@]} -gt 0 ]] && COMMON+=("${MODEL_ARGS[@]}")
 
@@ -122,20 +145,28 @@ else
   "${CMD[@]}" <<<"$PROMPT" >"$LOG" 2>&1 &
 fi
 PID=$!
+T0=$(date +%s); record running
 
 # portable timeout (macOS has no coreutils timeout)
 ELAPSED=0
 while kill -0 "$PID" 2>/dev/null; do
   if (( ELAPSED >= TIMEOUT )); then
     kill "$PID" 2>/dev/null; sleep 1; kill -9 "$PID" 2>/dev/null
+    record timeout ",\"duration\":$(( $(date +%s) - T0 ))"
     echo "claudex: timed out after ${TIMEOUT}s (effort=$EFFORT). Log tail:" >&2; tail -30 "$LOG" >&2
     echo "[claudex log: $LOG]" >&2; exit 124
   fi
   sleep 1; ELAPSED=$((ELAPSED+1))
 done
 wait "$PID"; RC=$?
+TOKENS="$(tr -d '\r' < "$LOG" | awk '/^tokens used$/{getline; gsub(/,/,""); print; exit}')"; TOKENS="${TOKENS:-0}"
+DUR=$(( $(date +%s) - T0 ))
+if grep "\"id\": *\"$STAMP\"" "$RUNS" 2>/dev/null | grep -q '"status": *"cancelled"'; then
+  echo "claudex: cancelled after ${DUR}s" >&2; echo "[claudex log: $LOG]" >&2; exit 130
+fi
 
 if [[ -s "$OUT" ]]; then
+  record done ",\"duration\":$DUR,\"tokens\":$TOKENS,\"rc\":$RC"
   if [[ $VERBOSE -eq 1 ]]; then
     echo "===== CLAUDEX TRANSCRIPT ($MODE, effort=$EFFORT) ====="
     # print the transcript up to the token count; codex repeats the final answer after it
@@ -144,5 +175,6 @@ if [[ -s "$OUT" ]]; then
   fi
   cat "$OUT"; echo; echo "[claudex log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
 else
+  record failed ",\"duration\":$DUR,\"tokens\":$TOKENS,\"rc\":$RC"
   echo "claudex: no final message produced (exit $RC). Log tail:" >&2; tail -40 "$LOG" >&2; exit 1
 fi

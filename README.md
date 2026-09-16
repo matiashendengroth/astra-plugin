@@ -63,6 +63,8 @@ Results are left uncommitted for you.
 | `/claudex-build <task>` | force the build flow on one task |
 | `/claudex <task>` | advisory flow: Claude writes the code, CLAUDEX advises and reviews |
 | `/claudex-effort [review\|build] <level>` | set Codex reasoning effort (minimal, low, medium, high, xhigh) |
+| `/claudex-status` | running builders/reviews, recent runs with duration and tokens, build worktrees |
+| `/claudex-cancel [--keep-worktrees]` | stop every running CLAUDEX process and clean up worktrees and branches |
 
 ## Reasoning effort and timeouts
 

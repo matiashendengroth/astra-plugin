@@ -1,7 +1,7 @@
 {
   "name": "claudex",
   "description": "Claude orchestrates, CLAUDEX (OpenAI Codex) builds and reviews. Claude classifies each task, writes specs, runs Codex builders in parallel git worktrees, merges, tests, gets an adversarial JSON review from Codex, and verifies every finding. One command to enable per project.",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "author": {
     "name": "Matias Henden"
   },

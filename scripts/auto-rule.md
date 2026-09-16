@@ -8,4 +8,5 @@ You are the orchestrator; CLAUDEX is the builder. Builds and reviews go through 
 - **Unclear bug**: one direct analysis pass via WRAPPER, then a build with the diagnosis.
 - After every build: run the tests, then spawn one `claudex` agent with "review: <dir>, acceptance criteria: <from spec>". It returns JSON findings; read the RESULT file it names. Open each finding, confirm or refute against the code, fix confirmed ones yourself if small, otherwise send them back as another build with the error. Never report done with unverified findings.
 - Builds need a clean git tree; if it is dirty, ask before starting. Leave results uncommitted.
+- Progress: `WRAPPER status -C "<dir>"` lists running builders and recent runs; tell the user to use `/claudex-status` and `/claudex-cancel` if they ask how to watch or stop it.
 <!-- claudex-auto:end -->

@@ -30,6 +30,9 @@ check "review json parses" 'o=$("$A" review -C "$T" --uncommitted --json | sed "
 check "review --ro honoured" 'o=$("$A" review -C "$T" --ro "One word: ok?"); [[ "$o" == *"sandbox=read-only"* ]]'
 check "build edits files, reports"  'printf "def sub(a,b):\n    return a-b\n" > "$T/ops.py"; git -C "$T" add -A; git -C "$T" -c user.email=t@t -c user.name=t commit -qm ops; o=$("$A" build -C "$T" -e low "Add a function mul(a,b) returning a*b to ops.py. Do nothing else."); grep -q "def mul" "$T/ops.py" && [[ "$o" == *"effort=low"* && "$o" == *"sandbox=workspace-write"* ]]'
 check "build default effort high"   'o=$("$A" build -C "$T" -t 3 "Add a comment line to ops.py." 2>&1); [[ "$o" == *"effort=high"* ]]'
+check "runs.jsonl records done + tokens" 'grep -q "\"status\":\"done\"" "$T/.claude/claudex-logs/runs.jsonl" && grep -q "\"tokens\":[1-9]" "$T/.claude/claudex-logs/runs.jsonl"'
+check "status lists recent runs"   'o=$("$A" status -C "$T"); [[ "$o" == *"Recent ("* && "$o" == *"done"* ]]'
+check "cancel kills builder + removes worktree" 'git -C "$T" worktree add -q -b claudex/t-1 .claudex-wt/1 HEAD; "$A" build -C "$T/.claudex-wt/1" -e xhigh "Write a 3000 word essay ESSAY.md in 12 sections." >/dev/null 2>&1 & sleep 5; o=$("$A" cancel -C "$T"); wait; [[ "$o" == *"cancelled"* ]] && [[ ! -d "$T/.claudex-wt" ]] && ! git -C "$T" branch | grep -q claudex/t-1'
 check "log rotation keeps <=80 files" '[[ $(ls "$T/.claude/claudex-logs" | wc -l) -le 80 ]]'
 
 echo; echo "passed=$pass failed=$fail"; [[ $fail -eq 0 ]]
