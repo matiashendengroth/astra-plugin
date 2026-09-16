@@ -80,6 +80,10 @@ Results are left uncommitted for you.
 
 `scripts/claudex` is a plain bash script around `codex exec`. Modes: default (question), `review`, `build`. Useful flags: `-C DIR`, `-e EFFORT`, `-t SECS`, `-v` (full transcript), `--json` (structured review), `-w` / `--ro` (sandbox). Transcripts persist in `.claude/claudex-logs/` (last 40 runs).
 
+JSON reviews report `coverage`: files actually opened, commands run, whether tests ran, their result, and confidence with a reason. The wrapper independently measures transcript `exec_count`, `tests_detected`, and `patched` (distinct paths in apply-patch blocks). Valid JSON output includes these under `measured`; plain reviews and invalid JSON get `[claudex coverage: exec=N tests=yes|no patched=K]`. The existing log-path footer remains; remove it before parsing JSON (and omit `-v`). For JSON reviews the saved `.last.md` (the RESULT file the relay returns) is the merged document; the model's untouched answer is kept next to it as `.raw.md`. Review done/failed registry events include the measured fields, and detected patches trigger a warning. Test detection indicates a matching command, not a passing result.
+
+Treat empty findings as low-confidence when no tests were detected, the model reports low confidence, or fewer than three exec calls were measured. Rerun at `-e high` or read the diff yourself, and state the coverage in your report.
+
 The run registry lives in the main worktree, so `status` and `cancel` also work from linked worktrees and subdirectories. Cancellation checks process identity and marks mismatches as stale. Cleanup only removes worktrees inside the main worktree's `.claudex-wt/` whose branches start with `claudex/`.
 
 ## Update

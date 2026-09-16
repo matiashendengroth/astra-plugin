@@ -27,6 +27,76 @@ set -uo pipefail
 
 die() { echo "claudex: $*" >&2; exit 2; }
 PY="$(command -v python3 || command -v python)"; [[ -n "$PY" ]] || die "Python 3 required (install python3 or python)"
+
+# Read only transcript tool blocks; mentions in answers/tool output are not commands.
+coverage() {
+  "$PY" - "$1" <<'PY'
+import re, sys
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    lines = f.read().replace("\r", "").splitlines()
+# Codex transcript framing: an "exec" header is followed by "<command> in <cwd>" (command may span
+# lines) and usually a " succeeded in Nms:" / " exited N in Nms:" result line. An "apply patch"
+# header is followed by "patch: completed" (or a patch body). Headers that are not followed by
+# that framing are transcript content (e.g. a file being cat'ed), not tool calls.
+RESULT = re.compile(r"^ (?:succeeded|exited \d+) in .*:$")
+CMD_END = re.compile(r" in (?:/|[A-Za-z]:[\\/]|~)\S.*$")   # "... in /abs/dir" ends the command
+HEADERS = ("exec", "apply patch", "thinking", "codex", "user", "tokens used", "file update")
+RUNNER = re.compile(r"^(?:sudo\s+)?(?:pytest|py\.test|python3?\s+-m\s+(?:pytest|unittest)|npm\s+(?:run\s+)?test|yarn\s+test|pnpm\s+test|npx\s+(?:jest|vitest)|jest|vitest|bun\s+test|node\s+--test|go\s+test|cargo\s+test|mvn\s+test|\.?/?gradlew?\s+test|dotnet\s+test|(?:bundle\s+exec\s+)?rspec|phpunit|make\s+test)(?:\s|$)")
+def command_runs_tests(cmd):
+    cmd = re.sub(r"^\S*(?:sh|bash|zsh|cmd(?:\.exe)?|powershell|pwsh)\s+(?:-\w+\s+)*", "", cmd)  # strip shell prefix
+    cmd = cmd.strip().strip("'\"")
+    for seg in re.split(r"\s*(?:;|&&|\|\||\||\n)\s*", cmd):
+        seg = re.sub(r"^(?:cd\s+\S+\s*)$", "", seg).strip().lstrip("(").strip()
+        if RUNNER.match(seg): return True
+    return False
+exec_count = 0; tests_detected = False; paths = set()
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if line == "exec":
+        # collect the command: lines until one ends with " in <cwd>" or a result/header line
+        j = i + 1; cmd = []
+        while j < len(lines) and lines[j] not in HEADERS and not RESULT.match(lines[j]):
+            cmd.append(lines[j])
+            if CMD_END.search(lines[j]): break
+            j += 1
+            if len(cmd) > 200: break
+        if cmd and CMD_END.search(cmd[-1]):           # framed like a real tool call
+            exec_count += 1
+            text = "\n".join(cmd); text = CMD_END.sub("", text, count=1) if len(cmd) == 1 else re.sub(CMD_END, "", text)
+            tests_detected |= command_runs_tests(text)
+            i = j + 1; continue
+        i += 1; continue
+    if line == "apply patch":
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if nxt.startswith("patch: ") or nxt == "*** Begin Patch":
+            j = i + 1
+            if nxt.startswith("patch: "):
+                # "patch: completed" is followed by the absolute paths touched, then a cumulative diff
+                j += 1
+                while j < len(lines) and lines[j] and not lines[j].startswith("diff --git") and lines[j] not in HEADERS:
+                    if re.match(r"(?:/|[A-Za-z]:[\\/]).+", lines[j]): paths.add(lines[j].strip())
+                    j += 1
+            else:
+                while j < len(lines) and lines[j] not in HEADERS and lines[j] != "*** End Patch":
+                    m = re.match(r"\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", lines[j])
+                    if m: paths.add(m.group(1))
+                    j += 1
+            i = j + 1; continue
+        i += 1; continue
+    i += 1
+print(exec_count, "yes" if tests_detected else "no", len(paths))
+PY
+}
+
+# Hidden offline entry point: no Codex installation or run registry required.
+if [[ "${1:-}" == coverage ]]; then
+  [[ $# -eq 2 && -f "$2" ]] || die "usage: claudex coverage <logfile>"
+  VALUES="$(coverage "$2")" || exit $?
+  read -r EXEC_COUNT TESTS_DETECTED PATCHED <<<"$VALUES"
+  echo "[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED patched=$PATCHED]"
+  exit 0
+fi
 command -v codex >/dev/null 2>&1 || die "codex CLI not found. Install: npm i -g @openai/codex  then run: codex  (to log in)"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -89,7 +159,7 @@ if [[ -z "$PROMPT" && "$MODE" != "review" && ! -t 0 ]]; then IFS= read -r -t 3 -
 [[ "$MODE" != "review" && -z "$PROMPT" ]] && die "no prompt given"
 
 LOG_DIR="${CLAUDEX_LOG_DIR:-$DIR/.claude/claudex-logs}"; mkdir -p "$LOG_DIR"; LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
-ls -t "$LOG_DIR" 2>/dev/null | tail -n +81 | while read -r f; do rm -f "$LOG_DIR/$f"; done   # keep last 40 runs (log+last)
+ls -t "$LOG_DIR" 2>/dev/null | tail -n +121 | while read -r f; do rm -f "$LOG_DIR/$f"; done   # keep last ~40 runs (log+last+raw)
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"; OUT="$LOG_DIR/$STAMP.last.md"; LOG="$LOG_DIR/$STAMP.log"
 
 # Run registry: one JSON line per event in the MAIN repo (so builders in worktrees are visible
@@ -102,11 +172,11 @@ fi
 RUNS="$ROOT/.claude/claudex-logs/runs.jsonl"; mkdir -p "$(dirname "$RUNS")"
 TOKEN="$("$PY" -c 'import secrets; print(secrets.token_hex(16))')"
 TITLE="$(printf '%s' "${PROMPT:-review}" | head -1)"
-record() {  # record <status> [duration [tokens rc]]
+record() {  # record <status> [duration [tokens rc [exec_count tests_detected patched]]]
   "$PY" - "$STAMP" "$1" "$MODE" "$EFFORT" "$SANDBOX" "$DIR" "$LOG" \
-    "$$" "${PID:-0}" "$TITLE" "$TOKEN" "${PSTART:-}" "${WSTART:-}" "${2:-}" "${3:-}" "${4:-}" >> "$RUNS" <<'PY'
+    "$$" "${PID:-0}" "$TITLE" "$TOKEN" "${PSTART:-}" "${WSTART:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" >> "$RUNS" <<'PY'
 import json, sys, time
-ident, status, mode, effort, sandbox, directory, log, wpid, pid, title, token, pstart, wstart, duration, tokens, rc = sys.argv[1:]
+ident, status, mode, effort, sandbox, directory, log, wpid, pid, title, token, pstart, wstart, duration, tokens, rc, exec_count, tests_detected, patched = sys.argv[1:]
 event = dict(id=ident, ts=int(time.time()), status=status, mode=mode, effort=effort,
              sandbox=sandbox, dir=directory, log=log, wpid=int(wpid), pid=int(pid),
              title=title[:160], token=token, pstart=pstart.strip(), wstart=wstart.strip())
@@ -114,6 +184,8 @@ for key, value in (("duration", duration), ("tokens", tokens), ("rc", rc)):
     if value:
         try: event[key] = int(value)
         except ValueError: event[key] = 0
+if exec_count:
+    event.update(exec_count=int(exec_count), tests_detected=tests_detected == "yes", patched=int(patched))
 print(json.dumps(event, separators=(",", ":")))
 PY
 }
@@ -136,7 +208,7 @@ if [[ "$MODE" == "review" ]]; then
     TEXT="Review $SCOPE. ${PROMPT:-Be adversarial: bugs, regressions, missed edge cases. Rank by severity.}"
     if [[ $JSON -eq 1 ]]; then
       # `codex exec review` ignores --output-schema, so structured reviews go through plain exec.
-      TEXT="You are doing an adversarial code review. $TEXT Report concrete problems with file and line: logic errors, regressions, and edge cases that would crash or return wrong results (empty inputs, missing keys, None, division by zero, off-by-one) even if no current caller triggers them. Do not report style or speculation. An empty findings array is correct when there is nothing concrete."
+      TEXT="You are doing an adversarial code review. $TEXT Report concrete problems with file and line: logic errors, regressions, and edge cases that would crash or return wrong results (empty inputs, missing keys, None, division by zero, off-by-one) even if no current caller triggers them. Do not report style or speculation. An empty findings array is correct when there is nothing concrete. Fill coverage truthfully: files_read lists only repo-relative paths you actually opened; commands_run lists commands you actually ran; tests_run and test_result describe tests you actually ran (use 'not run' otherwise). Set confidence to low if you did not run tests or did not read the changed files fully. Explain the scope and limitations in confidence_reason."
       CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" "$TEXT")
     else
       CMD=(codex exec -s "$SANDBOX" review "${COMMON[@]}" "$TEXT")
@@ -179,16 +251,50 @@ if grep "\"id\": *\"$STAMP\"" "$RUNS" 2>/dev/null | grep -q '"status": *"cancell
   echo "claudex: cancelled after ${DUR}s" >&2; echo "[claudex log: $LOG]" >&2; exit 130
 fi
 
+COVERAGE_ARGS=()
+if [[ "$MODE" == review ]]; then
+  VALUES="$(coverage "$LOG")" || die "could not measure review coverage"
+  read -r EXEC_COUNT TESTS_DETECTED PATCHED <<<"$VALUES"
+  COVERAGE_ARGS=("$EXEC_COUNT" "$TESTS_DETECTED" "$PATCHED")
+  COVERAGE_LINE="[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED patched=$PATCHED]"
+  [[ "$PATCHED" -gt 0 ]] && echo "claudex: WARNING: review transcript contains patches to $PATCHED distinct path(s)" >&2
+fi
+
 if [[ -s "$OUT" ]]; then
-  record done "$DUR" "$TOKENS" "$RC"
+  record done "$DUR" "$TOKENS" "$RC" "${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"}"
   if [[ $VERBOSE -eq 1 ]]; then
     echo "===== CLAUDEX TRANSCRIPT ($MODE, effort=$EFFORT) ====="
     # print the transcript up to the token count; codex repeats the final answer after it
     tr -d '\r' < "$LOG" | awk '/^tokens used$/{exit} {print}'
     echo "===== CLAUDEX FINAL ANSWER ====="
   fi
-  cat "$OUT"; echo; echo "[claudex log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
+  if [[ "$MODE" == review && $JSON -eq 1 ]]; then
+    "$PY" - "$OUT" "$EXEC_COUNT" "$TESTS_DETECTED" "$PATCHED" "$COVERAGE_LINE" <<'PY'
+import json, sys
+path, exec_count, tests_detected, patched, coverage_line = sys.argv[1:]
+with open(path, encoding="utf-8") as f:
+    answer = f.read()
+try:
+    result = json.loads(answer)
+    if not isinstance(result, dict):
+        raise ValueError("review must be a JSON object")
+except ValueError:
+    print(answer, end="")
+    print("\n" + coverage_line)
+else:
+    result["measured"] = dict(exec_count=int(exec_count), tests_detected=tests_detected == "yes", patched=int(patched))
+    merged = json.dumps(result, indent=2)
+    raw = path[:-len(".last.md")] + ".raw.md" if path.endswith(".last.md") else path + ".raw"
+    with open(raw, "w", encoding="utf-8") as f: f.write(answer)          # original model answer
+    with open(path, "w", encoding="utf-8") as f: f.write(merged + "\n")  # RESULT now carries "measured"
+    print(merged)
+PY
+  else
+    cat "$OUT"; echo
+    [[ "$MODE" == review ]] && echo "$COVERAGE_LINE"
+  fi
+  echo "[claudex log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
 else
-  record failed "$DUR" "$TOKENS" "$RC"
+  record failed "$DUR" "$TOKENS" "$RC" "${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"}"
   echo "claudex: no final message produced (exit $RC). Log tail:" >&2; tail -40 "$LOG" >&2; exit 1
 fi

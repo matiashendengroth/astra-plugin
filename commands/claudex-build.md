@@ -24,5 +24,7 @@ For each worktree: `git -C .claudex-wt/N add -A -- . ':!.claude/claudex-logs' &&
 ## 5 · CLAUDEX review
 Spawn one `claudex` agent: "review: <absolute project dir>. Acceptance criteria: <from brief>". Read the RESULT file it names for the JSON findings.
 
+Judge the review by its coverage. Treat an empty findings list as low-confidence when measured.tests_detected is false or coverage.confidence is low or exec_count < 3; in that case either rerun the review at -e high, or read the diff yourself before reporting. State the coverage in your report.
+
 ## 6 · Verify and report
 Open each finding, confirm or refute against the code, fix the confirmed ones, re-run tests. Report: chunks and what each built, merge conflicts resolved, findings confirmed/rejected, test results, assumptions CLAUDEX stated. Leave the result uncommitted for the user.

@@ -1,9 +1,22 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["summary", "findings"],
+  "required": ["summary", "findings", "coverage"],
   "properties": {
     "summary": { "type": "string", "description": "One or two sentences on overall state of the change." },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files_read", "commands_run", "tests_run", "test_result", "confidence", "confidence_reason"],
+      "properties": {
+        "files_read": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative paths the reviewer actually opened." },
+        "commands_run": { "type": "array", "items": { "type": "string" }, "description": "Commands the reviewer actually ran." },
+        "tests_run": { "type": "boolean" },
+        "test_result": { "type": "string", "description": "passed, failed, not run, or a truthful free-text result." },
+        "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+        "confidence_reason": { "type": "string" }
+      }
+    },
     "findings": {
       "type": "array",
       "items": {

@@ -20,9 +20,16 @@ mkdir -p "$T/stub-bin"
 cat > "$T/stub-bin/codex" <<'SH'
 #!/usr/bin/env bash
 while [[ $# -gt 0 ]]; do
-  if [[ "$1" == -o ]]; then printf 'stub answer\n' > "$2"; shift 2; else shift; fi
+  if [[ "$1" == -o ]]; then
+    if [[ "${STUB_FAIL:-0}" == 1 ]]; then :
+    elif [[ -n "${STUB_ANSWER:-}" ]]; then cat "$STUB_ANSWER" > "$2"
+    else printf 'stub answer\n' > "$2"; fi
+    shift 2
+  else shift; fi
 done
+[[ -n "${STUB_LOG:-}" ]] && cat "$STUB_LOG"
 printf 'tokens used\n1,234\n'
+[[ "${STUB_FAIL:-0}" != 1 ]]
 SH
 chmod +x "$T/stub-bin/codex"
 export PATH="$T/stub-bin:$PATH"
@@ -162,11 +169,118 @@ with contextlib.redirect_stdout(io.StringIO()), patch.object(m.time, "sleep"), p
 PY
 }
 check "cancel checks PID identity, completion races and worktree boundaries" 'registry_safety_checks'
+
+echo "review coverage checks (no network)"
+coverage_checks() {
+  "$PY" - "$A" "$T" <<'PY'
+import json, os, subprocess, sys
+wrapper, root = sys.argv[1:]
+directory = os.path.join(root, "coverage")
+os.makedirs(directory)
+log = os.path.join(directory, "transcript.log")
+transcript = """thinking
+Mentioning pytest here does not run it.
+exec
+/bin/bash -lc 'cat calc.py' in /repo succeeded in 2ms:
+npm test is mentioned in file contents only
+exec
+/bin/bash -lc 'git diff' in /repo succeeded in 2ms:
+diff output
+exec
+/bin/bash -lc 'npm test' in /repo succeeded in 2ms:
+passed
+exec
+/bin/bash -lc 'git status' in /repo succeeded in 2ms:
+ M calc.py
+apply patch
+*** Begin Patch
+*** Update File: calc.py
+@@
+-old
++new
+*** Update File: calc.py
+@@
+-old
++new
+*** End Patch
+codex
+*** Update File: not-a-patch.py
+"""
+with open(log, "wb") as f:
+    f.write(transcript.replace("\n", "\r\n").encode())
+line = "[claudex coverage: exec=4 tests=yes patched=1]"
+assert subprocess.check_output([wrapper, "coverage", log], text=True).strip() == line
+negative = os.path.join(directory, "negative.log")
+with open(negative, "w") as f:
+    # an "exec" header without codex's "<cmd> in <cwd>" framing is transcript content, not a tool call;
+    # runner names inside file contents or echo/rg arguments are not test runs; multi-line commands are
+    f.write("exec\ncat calc.py\nnpm test\ncodex\npytest\n*** Update File: fake.py\n"
+            "exec\n/bin/bash -lc 'cat pytest.ini' in /repo\n succeeded in 1ms:\n[pytest]\n"
+            "exec\n/bin/bash -lc 'echo \"npm test\"; rg jest package.json' in /repo\n succeeded in 1ms:\nnpm test\n"
+            "apply patch\n*** Update File: fake.py\n*** End Patch\n")
+assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=2 tests=no patched=0]"
+with open(negative, "w") as f:
+    f.write("exec\n/bin/bash -lc 'cd /repo\npython3 -m pytest -q' in /repo\n succeeded in 2ms:\nok\n"
+            "apply patch\npatch: completed\n/repo/a.py\n/repo/b.py\ndiff --git a/a.py b/a.py\ndiff --git a/zzz.py b/zzz.py\n\ncodex\nexec\n")
+assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=1 tests=yes patched=2]"
+with open(negative, "w") as f:
+    f.write("")
+assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=0 tests=no patched=0]"
+answer = os.path.join(directory, "answer.json")
+claimed = dict(summary="Nothing found", findings=[], coverage=dict(
+    files_read=["calc.py"], commands_run=["cat calc.py"], tests_run=False,
+    test_result="not run", confidence="low", confidence_reason="No tests run"))
+with open(answer, "w") as f:
+    json.dump(claimed, f)
+env = dict(os.environ, STUB_LOG=log, STUB_ANSWER=answer)
+measured = dict(exec_count=4, tests_detected=True, patched=1)
+registry = os.path.join(root, ".claude", "claudex-logs", "runs.jsonl")
+def run(*args, **extra):
+    mode = args[0] if args and args[0] == "review" else None
+    command = [wrapper] + ([mode] if mode else []) + ["-C", directory] + list(args[1:] if mode else args)
+    return subprocess.run(command, env=dict(env, **extra), text=True, capture_output=True)
+def last_event():
+    with open(registry) as f:
+        return json.loads(f.readlines()[-1])
+def check_event(status):
+    event = last_event()
+    assert event["status"] == status, event
+    assert {k: event[k] for k in measured} == measured, event
+result = run("review", "--json")
+assert result.returncode == 0, result.stderr
+assert "WARNING" in result.stderr and "1 distinct path" in result.stderr
+body, footer = result.stdout.rsplit("[claudex log:", 1)
+assert footer.strip().endswith("]")
+parsed = json.loads(body)
+assert parsed == dict(claimed, measured=measured), parsed
+check_event("done")
+# the RESULT file (.last.md) now carries the merged document; the raw model answer is kept alongside
+with open(last_event()["log"].replace(".log", ".last.md")) as f:
+    assert json.load(f) == dict(claimed, measured=measured)
+with open(last_event()["log"].replace(".log", ".raw.md")) as f:
+    assert json.load(f) == claimed
+result = run("review")
+assert result.returncode == 0 and line in result.stdout
+check_event("done")
+with open(answer, "w") as f:
+    f.write("invalid JSON\n")
+result = run("review", "--json")
+assert result.returncode == 0 and result.stdout.startswith("invalid JSON\n\n" + line)
+check_event("done")
+result = run("review", "--json", STUB_FAIL="1")
+assert result.returncode == 1 and "no final message" in result.stderr
+check_event("failed")
+result = run("exec prompt")
+assert result.returncode == 0 and "[claudex coverage:" not in result.stdout
+assert all(k not in last_event() for k in measured)
+PY
+}
+check "measures CRLF transcripts, merges JSON, flags patches and records review events" 'coverage_checks'
 # Keep live smoke tests isolated from the offline fixtures.
 git -C "$T" worktree remove --force "$T/.claudex-wt/other"
 rmdir "$T/.claudex-wt"
 git -C "$T" worktree remove --force "$T/linked"
-rm -rf "$T/stub-bin" "$T/separate" "$T/separate-meta" "$T/nonrepo" "$T/safety" "$LONG_DIR"
+rm -rf "$T/stub-bin" "$T/separate" "$T/separate-meta" "$T/nonrepo" "$T/safety" "$T/coverage" "$LONG_DIR"
 export PATH="$REAL_PATH"
 if [[ $NETWORK -eq 0 ]]; then
   echo "skipping live Codex checks (--offline or codex unavailable)"
@@ -181,7 +295,7 @@ check "relative -C"        'o=$(cd "$(dirname "$T")" && "$A" -C "$(basename "$T"
 check "conf effort honoured" 'mkdir -p "$T/.claude"; echo effort=medium > "$T/.claude/claudex.conf"; o=$("$A" -C "$T" "Reply with exactly: A4"); rm "$T/.claude/claudex.conf"; [[ "$o" == *"effort=medium"* ]]'
 check "timeout kills run"  'o=$("$A" -C "$T" -t 2 -e xhigh "Write a 2000 word essay about sorting." 2>&1); rc=$?; [[ $rc -eq 124 && "$o" == *"timed out"* ]]'
 check "review plain"       'o=$("$A" review -C "$T" --uncommitted "One line: is add correct now?"); [[ "$o" == *"effort=medium"* && "$o" == *"sandbox=workspace-write"* ]]'
-check "review json parses" 'o=$("$A" review -C "$T" --uncommitted --json | sed "/^\[claudex log/d"); echo "$o" | "$PY" -c "import sys,json; d=json.load(sys.stdin); assert \"findings\" in d"'
+check "review json parses with claimed and measured coverage" 'o=$("$A" review -C "$T" --uncommitted --json | sed "/^\[claudex log/d"); echo "$o" | "$PY" -c "import sys,json; d=json.load(sys.stdin); assert \"findings\" in d; assert d[\"coverage\"][\"confidence\"] in (\"high\", \"medium\", \"low\"); assert type(d[\"measured\"][\"exec_count\"]) is int"'
 check "review --ro honoured" 'o=$("$A" review -C "$T" --ro "One word: ok?"); [[ "$o" == *"sandbox=read-only"* ]]'
 check "build edits files, reports"  'printf "def sub(a,b):\n    return a-b\n" > "$T/ops.py"; git -C "$T" add -A; git -C "$T" -c user.email=t@t -c user.name=t commit -qm ops; o=$("$A" build -C "$T" -e low "Add a function mul(a,b) returning a*b to ops.py. Do nothing else."); grep -q "def mul" "$T/ops.py" && [[ "$o" == *"effort=low"* && "$o" == *"sandbox=workspace-write"* ]]'
 check "build default effort high"   'o=$("$A" build -C "$T" -t 3 "Add a comment line to ops.py." 2>&1); [[ "$o" == *"effort=high"* ]]'
