@@ -1,3 +1,4 @@
 .claude/claudex-logs/
 .claude/astra-logs/
 __pycache__/
+.claudex-wt/
