@@ -26,6 +26,7 @@
 set -uo pipefail
 
 die() { echo "claudex: $*" >&2; exit 2; }
+PY="$(command -v python3 || command -v python)"; [[ -n "$PY" ]] || die "Python 3 required (install python3 or python)"
 command -v codex >/dev/null 2>&1 || die "codex CLI not found. Install: npm i -g @openai/codex  then run: codex  (to log in)"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -37,7 +38,6 @@ case "${1:-}" in
   status|cancel)  # delegate to the runs tool; accepts -C DIR and, for cancel, --keep-worktrees
     SUB="$1"; shift; SDIR="$PWD"; EXTRA=()
     while [[ $# -gt 0 ]]; do case "$1" in -C) SDIR="$2"; shift 2 ;; *) EXTRA+=("$1"); shift ;; esac; done
-    PY="$(command -v python3 || command -v python)"; [[ -n "$PY" ]] || die "python 3 required for $SUB"
     exec "$PY" "$HERE/claudex-runs.py" "$SUB" "$SDIR" "${EXTRA[@]+"${EXTRA[@]}"}" ;;
 esac
 while [[ $# -gt 0 ]]; do
@@ -95,15 +95,27 @@ STAMP="$(date +%Y%m%d-%H%M%S)-$$"; OUT="$LOG_DIR/$STAMP.last.md"; LOG="$LOG_DIR/
 # Run registry: one JSON line per event in the MAIN repo (so builders in worktrees are visible
 # together). Status/cancel read this. ROOT = main worktree of the repo containing DIR, else DIR.
 ROOT="$DIR"
-if GCD="$(git -C "$DIR" rev-parse --git-common-dir 2>/dev/null)"; then
-  [[ "$GCD" != /* ]] && GCD="$DIR/$GCD"; ROOT="$(cd "$(dirname "$GCD")" && pwd -P)"
+if WTS="$(git -C "$DIR" worktree list --porcelain 2>/dev/null)"; then
+  MAIN="$(printf '%s\n' "$WTS" | sed -n 's/^worktree //p' | head -1)"
+  [[ -n "$MAIN" ]] && ROOT="$MAIN"
 fi
 RUNS="$ROOT/.claude/claudex-logs/runs.jsonl"; mkdir -p "$(dirname "$RUNS")"
-jesc() { printf '%s' "$1" | tr -d '\r' | sed 's/\\/\\\\/g; s/"/\\"/g' | head -c 160; }
-TITLE="$(jesc "$(printf '%s' "${PROMPT:-review}" | head -1)")"
-record() {  # record <status> [extra json fields]
-  printf '{"id":"%s","ts":%s,"status":"%s","mode":"%s","effort":"%s","sandbox":"%s","dir":"%s","log":"%s","wpid":%s,"pid":%s,"title":"%s"%s}\n' \
-    "$STAMP" "$(date +%s)" "$1" "$MODE" "$EFFORT" "$SANDBOX" "$(jesc "$DIR")" "$(jesc "$LOG")" "$$" "${PID:-0}" "$TITLE" "${2:-}" >> "$RUNS"
+TOKEN="$("$PY" -c 'import secrets; print(secrets.token_hex(16))')"
+TITLE="$(printf '%s' "${PROMPT:-review}" | head -1)"
+record() {  # record <status> [duration [tokens rc]]
+  "$PY" - "$STAMP" "$1" "$MODE" "$EFFORT" "$SANDBOX" "$DIR" "$LOG" \
+    "$$" "${PID:-0}" "$TITLE" "$TOKEN" "${PSTART:-}" "${WSTART:-}" "${2:-}" "${3:-}" "${4:-}" >> "$RUNS" <<'PY'
+import json, sys, time
+ident, status, mode, effort, sandbox, directory, log, wpid, pid, title, token, pstart, wstart, duration, tokens, rc = sys.argv[1:]
+event = dict(id=ident, ts=int(time.time()), status=status, mode=mode, effort=effort,
+             sandbox=sandbox, dir=directory, log=log, wpid=int(wpid), pid=int(pid),
+             title=title[:160], token=token, pstart=pstart.strip(), wstart=wstart.strip())
+for key, value in (("duration", duration), ("tokens", tokens), ("rc", rc)):
+    if value:
+        try: event[key] = int(value)
+        except ValueError: event[key] = 0
+print(json.dumps(event, separators=(",", ":")))
+PY
 }
 
 COMMON=(--skip-git-repo-check -o "$OUT" -c "model_reasoning_effort=\"$EFFORT\"")
@@ -145,6 +157,8 @@ else
   "${CMD[@]}" <<<"$PROMPT" >"$LOG" 2>&1 &
 fi
 PID=$!
+PSTART="$(ps -o lstart= -p "$PID" 2>/dev/null || true)"
+WSTART="$(ps -o lstart= -p "$$" 2>/dev/null || true)"
 T0=$(date +%s); record running
 
 # portable timeout (macOS has no coreutils timeout)
@@ -152,7 +166,7 @@ ELAPSED=0
 while kill -0 "$PID" 2>/dev/null; do
   if (( ELAPSED >= TIMEOUT )); then
     kill "$PID" 2>/dev/null; sleep 1; kill -9 "$PID" 2>/dev/null
-    record timeout ",\"duration\":$(( $(date +%s) - T0 ))"
+    record timeout "$(( $(date +%s) - T0 ))"
     echo "claudex: timed out after ${TIMEOUT}s (effort=$EFFORT). Log tail:" >&2; tail -30 "$LOG" >&2
     echo "[claudex log: $LOG]" >&2; exit 124
   fi
@@ -166,7 +180,7 @@ if grep "\"id\": *\"$STAMP\"" "$RUNS" 2>/dev/null | grep -q '"status": *"cancell
 fi
 
 if [[ -s "$OUT" ]]; then
-  record done ",\"duration\":$DUR,\"tokens\":$TOKENS,\"rc\":$RC"
+  record done "$DUR" "$TOKENS" "$RC"
   if [[ $VERBOSE -eq 1 ]]; then
     echo "===== CLAUDEX TRANSCRIPT ($MODE, effort=$EFFORT) ====="
     # print the transcript up to the token count; codex repeats the final answer after it
@@ -175,6 +189,6 @@ if [[ -s "$OUT" ]]; then
   fi
   cat "$OUT"; echo; echo "[claudex log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
 else
-  record failed ",\"duration\":$DUR,\"tokens\":$TOKENS,\"rc\":$RC"
+  record failed "$DUR" "$TOKENS" "$RC"
   echo "claudex: no final message produced (exit $RC). Log tail:" >&2; tail -40 "$LOG" >&2; exit 1
 fi

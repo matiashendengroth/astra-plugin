@@ -80,6 +80,8 @@ Results are left uncommitted for you.
 
 `scripts/claudex` is a plain bash script around `codex exec`. Modes: default (question), `review`, `build`. Useful flags: `-C DIR`, `-e EFFORT`, `-t SECS`, `-v` (full transcript), `--json` (structured review), `-w` / `--ro` (sandbox). Transcripts persist in `.claude/claudex-logs/` (last 40 runs).
 
+The run registry lives in the main worktree, so `status` and `cancel` also work from linked worktrees and subdirectories. Cancellation checks process identity and marks mismatches as stale. Cleanup only removes worktrees inside the main worktree's `.claudex-wt/` whose branches start with `claudex/`.
+
 ## Update
 
 ```
@@ -91,7 +93,7 @@ then restart. Projects need no re-setup; the launcher resolves the newest instal
 
 ## Development
 
-`scripts/test.sh` runs a 16-case smoke suite against a temp repo (needs a signed-in Codex, ~5 min).
+`scripts/test.sh` runs offline registry checks and live smoke tests against a temporary repo (live tests need a signed-in Codex, ~5 min). Use `bash scripts/test.sh --offline` to run only the checks that need no network.
 
 ## License
 
