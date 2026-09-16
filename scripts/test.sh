@@ -21,6 +21,8 @@ mkdir -p "$T/stub-bin"
 cat > "$T/stub-bin/codex" <<'SH'
 #!/usr/bin/env bash
 if [[ "${1:-}" == --version ]]; then echo "codex-cli test-version"; exit 0; fi
+if [[ -n "${STUB_ARGS:-}" ]]; then printf '%s\n' "$@" > "$STUB_ARGS"; fi
+if [[ -n "${STUB_INPUT:-}" ]]; then cat > "$STUB_INPUT"; fi
 while [[ $# -gt 0 ]]; do
   if [[ "$1" == -o ]]; then
     if [[ "${STUB_FAIL:-0}" == 1 ]]; then :
@@ -216,7 +218,7 @@ codex
 """
 with open(log, "wb") as f:
     f.write(transcript.replace("\n", "\r\n").encode())
-line = "[claudex coverage: exec=4 tests=yes patched=1]"
+line = "[claudex coverage: exec=4 tests=yes executed=no patched=1]"
 assert subprocess.check_output([wrapper, "coverage", log], text=True).strip() == line
 negative = os.path.join(directory, "negative.log")
 with open(negative, "w") as f:
@@ -226,14 +228,32 @@ with open(negative, "w") as f:
             "exec\n/bin/bash -lc 'cat pytest.ini' in /repo\n succeeded in 1ms:\n[pytest]\n"
             "exec\n/bin/bash -lc 'echo \"npm test\"; rg jest package.json' in /repo\n succeeded in 1ms:\nnpm test\n"
             "apply patch\n*** Update File: fake.py\n*** End Patch\n")
-assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=2 tests=no patched=0]"
+assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=2 tests=no executed=no patched=0]"
 with open(negative, "w") as f:
     f.write("exec\n/bin/bash -lc 'cd /repo\npython3 -m pytest -q' in /repo\n succeeded in 2ms:\nok\n"
             "apply patch\npatch: completed\n/repo/a.py\n/repo/b.py\ndiff --git a/a.py b/a.py\ndiff --git a/zzz.py b/zzz.py\n\ncodex\nexec\n")
-assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=1 tests=yes patched=2]"
+assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=1 tests=yes executed=yes patched=2]"
 with open(negative, "w") as f:
     f.write("")
-assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=0 tests=no patched=0]"
+assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=0 tests=no executed=no patched=0]"
+# Ad hoc execution is distinct from merely reading code or mentioning a runner.
+for command, expected in [
+    ("python3 <<'PY'\nprint(1)\nPY", True),
+    ("python <<'PY'\nprint(1)\nPY", True),
+    ("cat x.py", False), ("echo python3; cat x.py", False),
+    ("node -e '1'", True), ("deno run x.ts", True), ("bun x.ts", True),
+    ("ruby x.rb", True), ("php x.php", True), ("go run main.go", True),
+    ("cargo run", True), ("npx ts-node main.ts", True), ("npx tsx main.ts", True), ("ts-node x.ts", True),
+    ("go version", False), ("cargo check", False),
+    ("bash -c './script.sh'", True), ("sh -c 'sh script'", True),
+    ("bash -c 'cat x.py'", False), ("bash -c '/usr/bin/cat x.py'", False),
+    ("cd /repo && bash -c './script.sh'", True),
+    ("bash -c 'cat x.py' && python3 x.py", True),
+    ("/bin/bash -lc \"python3 <<'PY'\nprint(1)\nPY\"", True),
+]:
+    with open(negative, "w") as f: f.write("exec\n" + command + " in /repo\n succeeded in 1ms:\n")
+    output = subprocess.check_output([wrapper, "coverage", negative], text=True)
+    assert ("executed=yes" in output) == expected, (command, output)
 answer = os.path.join(directory, "answer.json")
 claimed = dict(summary="Nothing found", findings=[], coverage=dict(
     files_read=["calc.py"], commands_run=["cat calc.py"], tests_run=False,
@@ -241,10 +261,10 @@ claimed = dict(summary="Nothing found", findings=[], coverage=dict(
 with open(answer, "w") as f:
     json.dump(claimed, f)
 env = dict(os.environ, STUB_LOG=log, STUB_ANSWER=answer)
-measured = dict(exec_count=4, tests_detected=True, patched=1)
+measured = dict(exec_count=4, tests_detected=True, executed=False, patched=1)
 registry = os.path.join(root, ".claude", "claudex-logs", "runs.jsonl")
 def run(*args, **extra):
-    mode = args[0] if args and args[0] == "review" else None
+    mode = args[0] if args and args[0] in ("review", "build") else None
     command = [wrapper] + ([mode] if mode else []) + ["-C", directory] + list(args[1:] if mode else args)
     return subprocess.run(command, env=dict(env, **extra), text=True, capture_output=True)
 def last_event():
@@ -267,7 +287,12 @@ with open(last_event()["log"].replace(".log", ".last.md")) as f:
     assert json.load(f) == dict(claimed, measured=measured)
 with open(last_event()["log"].replace(".log", ".raw.md")) as f:
     assert json.load(f) == claimed
-result = run("review")
+args_file = os.path.join(directory, "args.txt")
+result = run("review", STUB_ARGS=args_file)
+with open(args_file) as f: arguments = f.read().splitlines()
+assert arguments[0] == "exec" and "review" not in arguments and "--output-schema" not in arguments
+assert any("adversarial code review" in arg and "uncommitted changes" in arg for arg in arguments)
+assert last_event()["tokens"] == 1234
 assert result.returncode == 0 and line in result.stdout
 check_event("done")
 with open(answer, "w") as f:
@@ -278,6 +303,24 @@ check_event("done")
 result = run("review", "--json", STUB_FAIL="1")
 assert result.returncode == 1 and "no final message" in result.stderr
 check_event("failed")
+build = dict(summary="Implemented", files_changed=[dict(path="calc.py", change="modified", why="Fix addition")],
+             commands_run=["npm test"], tests_run=True, test_result="passed", assumptions=[], left_undone=[],
+             needs_attention=["Review addition"])
+with open(answer, "w") as f: json.dump(build, f)
+input_file = os.path.join(directory, "input.txt")
+result = run("build", "implement addition", STUB_ARGS=args_file, STUB_INPUT=input_file)
+assert result.returncode == 0 and not result.stderr, result
+assert json.loads(result.stdout.rsplit("[claudex log:", 1)[0]) == dict(build, measured=measured)
+with open(args_file) as f: arguments = f.read().splitlines()
+assert arguments[arguments.index("--output-schema") + 1].endswith("/build-schema.json")
+with open(input_file) as f: assert "final message must be JSON" in f.read()
+check_event("done")
+with open(last_event()["log"].replace(".log", ".last.md")) as f: assert json.load(f) == dict(build, measured=measured)
+with open(last_event()["log"].replace(".log", ".raw.md")) as f: assert json.load(f) == build
+with open(answer, "w") as f: f.write("invalid build JSON")
+result = run("build", "implement addition")
+assert result.returncode == 0 and "invalid build JSON\n" + line in result.stdout, result
+check_event("done")
 result = run("exec prompt")
 assert result.returncode == 0 and "[claudex coverage:" not in result.stdout
 assert all(k not in last_event() for k in measured)
@@ -594,14 +637,133 @@ assert m.fingerprint(str(content)) != value  # exactly 1 MiB still hashes conten
 large.write_bytes(b"a" * (1024 * 1024 + 1))
 value = m.fingerprint(str(content))
 large.write_bytes(b"b" * (1024 * 1024 + 1))
-assert m.fingerprint(str(content)) == value
+assert m.fingerprint(str(content)) != value  # large files use size AND mtime
 large.write_bytes(b"b" * (1024 * 1024 + 2))
 assert m.fingerprint(str(content)) != value
 value = m.fingerprint(str(content))
 large.rename(content / "renamed.bin")
 assert m.fingerprint(str(content)) != value
+# Bound content reads, include metadata for the remainder, and keep cached cutoffs stable.
+many = repo("many-untracked")
+for i in range(350): (many / f"untracked-{i:03}.txt").write_text("contents")
+start = time.monotonic()
+assert json.loads(stop(directory=many))["decision"] == "block"
+assert time.monotonic() - start < 3
+value = m.fingerprint(str(many))
+assert m.fingerprint(str(many)) == value
+late = many / "untracked-349.txt"
+late.write_text("CONTENTS")  # unchanged size, changed mtime
+assert m.fingerprint(str(many)) != value
+# Force a time cutoff independently of machine speed; cached output stays stable.
+(many / ".claude/claudex-logs/.fingerprint.json").unlink()
+snapshot = m.changes(str(many))
+real_open = open
+reads = []
+def counted_open(path, *args, **kwargs):
+    if args and args[0] == "rb": reads.append(path)
+    return real_open(path, *args, **kwargs)
+with patch("builtins.open", side_effect=counted_open), patch.object(m.time, "monotonic", side_effect=lambda: 2 if reads else 0):
+    timed = m.fingerprint(str(many), snapshot=snapshot)
+assert len(reads) == 1
+assert m.fingerprint(str(many)) == timed
+(many / ".claude/claudex-logs/.fingerprint.json").unlink()
+reads.clear()
+with patch("builtins.open", side_effect=counted_open), patch.object(m.time, "monotonic", return_value=0):
+    m.fingerprint(str(many), snapshot=snapshot)
+assert len(reads) == 300
+# A blocked stdin is also inside the whole-hook timeout, with no output.
+start = time.monotonic()
+process = subprocess.Popen(["bash", str(hook)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    assert process.wait(timeout=5) == 0
+    assert process.stdout.read() == b"" and process.stderr.read() == b""
+    assert time.monotonic() - start < 5
+finally:
+    process.stdin.close()
+    if process.poll() is None: process.kill(); process.wait()
+
+# Direct edits: enabled projects only, all three tools, deduplication and shared roots.
+edited = repo("direct-edits")
+edit_hook = here / "claudex-hook-edit"
+def edit(directory, tool="Edit", path="tracked file.txt"):
+    result = run(["bash", edit_hook], input=json.dumps(dict(cwd=str(directory), tool_name=tool, tool_input=dict(file_path=path))))
+    assert not result.stdout and not result.stderr
+edit(edited, "Read")
+assert not (edited / ".claude/claudex-logs/edits.jsonl").exists()
+(edited / "CLAUDE.md").write_text("disabled")
+edit(edited)
+assert not (edited / ".claude/claudex-logs/edits.jsonl").exists()
+(edited / "CLAUDE.md").write_text("<!-- claudex-auto:start -->\n")
+for tool in ("Edit", "Write", "MultiEdit"): edit(edited, tool)
+entries = [json.loads(line) for line in (edited / ".claude/claudex-logs/edits.jsonl").read_text().splitlines()]
+assert len(entries) == 3 and all(set(entry) == {"ts", "path"} for entry in entries)
+assert "Direct edits by Claude since last build/review: 1 files" in cli(edited, "status").stdout
+(edited / "tracked file.txt").write_text("direct change")
+assert json.loads(stop(directory=edited))["reason"].endswith(": Claude edited 1 file(s) directly this change set")
+seed(edited, [dict(id="latest", status="done", mode="build", ts=int(time.time()) + 1)])
+assert "Direct edits by Claude since last build/review: 0 files" in cli(edited, "status").stdout
+seed(edited, [dict(id="latest", status="done", mode="review", ts=int(time.time()) - 60)])
+assert "Direct edits by Claude since last build/review: 1 files" in cli(edited, "status").stdout
+edit_linked = base / "edit-linked"
+git(edited, "worktree", "add", "-q", "--detach", str(edit_linked), "HEAD")
+try:
+    edit(edit_linked, path="another.txt")
+    assert m.direct_edits(str(edited)) == 2
+    assert not (edit_linked / ".claude/claudex-logs/edits.jsonl").exists()
+finally: git(edited, "worktree", "remove", "--force", str(edit_linked))
+assert not run(["bash", edit_hook], input="invalid json").stdout
+
+# Merge commits builder changes, reports overlaps, preserves foreign/conflicting branches.
+def merge_repo(name, conflict=False):
+    project = repo(name)
+    git(project, "config", "user.email", "t@t")
+    git(project, "config", "user.name", "t")
+    for branch in ("claudex/a", "claudex/b", "foreign"):
+        path = project / ".claudex-wt" / branch.split("/")[-1]
+        git(project, "worktree", "add", "-q", "-b", branch, str(path), "HEAD")
+        filename = "tracked file.txt" if conflict and branch.startswith("claudex/") else branch.split("/")[-1] + ".txt"
+        (path / filename).write_text(branch + "\n")
+        logs = path / ".claude/claudex-logs"
+        logs.mkdir(parents=True)
+        (logs / "run.log").write_text("ignored builder transcript")
+    return project
+for conflict in (False, True):
+    project = merge_repo("merge-conflict" if conflict else "merge-disjoint", conflict)
+    result = subprocess.run(["bash", str(wrapper), "merge", "-C", str(project)], text=True, capture_output=True)
+    assert result.returncode == (4 if conflict else 0), result
+    assert "MERGED claudex/a" in result.stdout and "Overlap table:" in result.stdout
+    assert not (project / ".claudex-wt/a").exists()
+    branches = git(project, "branch", "--format=%(refname:short)").stdout.splitlines()
+    assert "claudex/a" not in branches and "foreign" in branches
+    assert (project / ".claudex-wt/foreign/foreign.txt").exists()
+    assert not (project / "foreign.txt").exists()
+    if conflict:
+        assert 'CONFLICT claudex/b: "tracked file.txt"' in result.stdout
+        assert 'claudex/a | claudex/b | "tracked file.txt"' in result.stdout
+        assert (project / ".claudex-wt/b").exists() and "claudex/b" in branches
+        assert (project / "tracked file.txt").read_text() == "claudex/a\n"
+        # A later disjoint branch must still merge after the conflict was aborted.
+        third = project / ".claudex-wt/z"
+        git(project, "worktree", "add", "-q", "-b", "claudex/z", str(third), "HEAD")
+        (third / "z.txt").write_text("third")
+        result = subprocess.run(["bash", str(wrapper), "merge", "-C", str(project)], text=True, capture_output=True)
+        assert result.returncode == 4 and "MERGED claudex/z" in result.stdout, result
+        assert not third.exists() and (project / "z.txt").read_text() == "third"
+    else:
+        assert "MERGED claudex/b" in result.stdout and "claudex/b" not in branches
+        assert not (project / ".claudex-wt/b").exists()
+        assert (project / "a.txt").read_text() == "claudex/a\n"
+        assert (project / "b.txt").read_text() == "claudex/b\n"
+    assert not git(project, "status", "--porcelain").stdout
+project = merge_repo("merge-dirty")
+(project / "dirty.txt").write_text("dirty")
+result = subprocess.run(["bash", str(wrapper), "merge", "-C", str(project)], text=True, capture_output=True)
+assert result.returncode == 2 and "current tree is dirty" in result.stderr
+assert (project / ".claudex-wt/a").exists() and (project / ".claudex-wt/b").exists()
+assert git(project / ".claudex-wt/a", "status", "--porcelain").stdout  # refused before committing
 manifest = json.loads((here.parent / "hooks/hooks.json").read_text())
-assert manifest == {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": '"${CLAUDE_PLUGIN_ROOT}/scripts/claudex-hook-stop"', "timeout": 20}]}]}}
+assert manifest["hooks"]["Stop"] == [{"hooks": [{"type": "command", "command": '\"${CLAUDE_PLUGIN_ROOT}/scripts/claudex-hook-stop\"', "timeout": 20}]}]
+assert manifest["hooks"]["PostToolUse"] == [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": '\"${CLAUDE_PLUGIN_ROOT}/scripts/claudex-hook-edit\"', "timeout": 5}]}]
 PY
 }
 echo "preflight, budget and Stop hook checks (no network)"

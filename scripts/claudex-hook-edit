@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Claude Code Stop hook: keep stdout reserved for a blocking JSON decision.
+# Measure direct Claude edits without interfering with the tool's result.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PY="$(command -v python3 || command -v python || true)"
 [[ -n "$PY" ]] || exit 0
-"$PY" "$HERE/claudex-runs.py" guard-stop-hook "$HOME/.local/bin/claudex" 2>/dev/null || true
+"$PY" "$HERE/claudex-runs.py" guard-edit-hook unused >/dev/null 2>&1 || true
