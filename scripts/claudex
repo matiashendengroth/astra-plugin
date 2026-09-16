@@ -175,24 +175,50 @@ if WTS="$(git -C "$DIR" worktree list --porcelain 2>/dev/null)"; then
 fi
 RUNS="$ROOT/.claude/claudex-logs/runs.jsonl"; mkdir -p "$(dirname "$RUNS")"
 "$PY" "$HERE/claudex-runs.py" budget "$ROOT" --warn-only
-if [[ "$MODE" == build ]]; then
+BUILDERS_LOCK="$ROOT/.claude/claudex-logs/.builders.lock"; LOCK_HELD=0
+release_builders() {
+  if [[ "$LOCK_HELD" == 1 ]]; then rmdir "$BUILDERS_LOCK" 2>/dev/null || true; LOCK_HELD=0; fi
+}
+trap release_builders EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+reserve_builder() {
+  local lock_start=$SECONDS
+  while :; do
+    if mkdir "$BUILDERS_LOCK" 2>/dev/null; then LOCK_HELD=1; break; fi
+    # Only lock expiry uses timestamps; review freshness is content-based.
+    "$PY" - "$BUILDERS_LOCK" <<'PY'
+import os, sys, time
+try:
+    if time.time() - os.stat(sys.argv[1]).st_mtime > 60: os.rmdir(sys.argv[1])
+except OSError: pass
+PY
+    if (( SECONDS - lock_start >= 5 )); then
+      echo "claudex: builder lock timed out after 5s; proceeding without lock" >&2
+      break
+    fi
+    sleep 0.1
+  done
   MAX_BUILDERS="$("$PY" "$HERE/claudex-runs.py" max-builders "$ROOT")" || exit $?
   RUNNING="$("$PY" "$HERE/claudex-runs.py" count-running "$ROOT" build)" || exit $?
   if (( RUNNING >= MAX_BUILDERS )); then
     echo "claudex: build budget reached ($RUNNING running); wait, raise max_builders in .claude/claudex.conf, or run claudex cancel" >&2
     exit 3
   fi
-fi
+}
 TOKEN="$("$PY" -c 'import secrets; print(secrets.token_hex(16))')"
 TITLE="$(printf '%s' "${PROMPT:-review}" | head -1)"
 record() {  # record <status> [duration [tokens rc [exec_count tests_detected patched]]]
   "$PY" - "$STAMP" "$1" "$MODE" "$EFFORT" "$SANDBOX" "$DIR" "$LOG" \
-    "$$" "${PID:-0}" "$TITLE" "$TOKEN" "${PSTART:-}" "${WSTART:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" >> "$RUNS" <<'PY'
-import json, sys, time
-ident, status, mode, effort, sandbox, directory, log, wpid, pid, title, token, pstart, wstart, duration, tokens, rc, exec_count, tests_detected, patched = sys.argv[1:]
+    "$$" "${PID:-0}" "$TITLE" "$TOKEN" "${PSTART:-}" "${WSTART:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${REVIEW_SCOPE:-}" "${REVIEW_FINGERPRINT:-}" >> "$RUNS" <<'PY'
+import json, os, sys, time
+ident, status, mode, effort, sandbox, directory, log, wpid, pid, title, token, pstart, wstart, duration, tokens, rc, exec_count, tests_detected, patched, scope, fingerprint = sys.argv[1:]
 event = dict(id=ident, ts=int(time.time()), status=status, mode=mode, effort=effort,
-             sandbox=sandbox, dir=directory, log=log, wpid=int(wpid), pid=int(pid),
+             sandbox=sandbox, dir=os.path.realpath(directory), log=log, wpid=int(wpid), pid=int(pid), command="codex",
              title=title[:160], token=token, pstart=pstart.strip(), wstart=wstart.strip())
+if mode == "review" and status == "done":
+    event.update(scope=scope, fingerprint=fingerprint)
 for key, value in (("duration", duration), ("tokens", tokens), ("rc", rc)):
     if value:
         try: event[key] = int(value)
@@ -209,6 +235,8 @@ COMMON=(--skip-git-repo-check -o "$OUT" -c "model_reasoning_effort=\"$EFFORT\"")
 if [[ "$MODE" == "review" ]]; then
   [[ $JSON -eq 1 ]] && COMMON+=(--output-schema "$HERE/review-schema.json")
   [[ ${#REVIEW_ARGS[@]} -eq 0 ]] && REVIEW_ARGS=(--uncommitted)
+  REVIEW_SCOPE="${REVIEW_ARGS[0]#--}"
+  REVIEW_FINGERPRINT="$("$PY" "$HERE/claudex-runs.py" fingerprint "$DIR")" || die "could not fingerprint review directory"
   if [[ -n "$PROMPT" || $JSON -eq 1 ]]; then
     # a custom prompt cannot be combined with scope flags; fold the scope into the text
     case "${REVIEW_ARGS[0]}" in
@@ -236,6 +264,7 @@ elif [[ "$MODE" == "build" ]]; then
 SPEC:
 $PROMPT"
   CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" -)
+  reserve_builder
   "${CMD[@]}" <<<"$TEXT" >"$LOG" 2>&1 &
 else
   CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" -)
@@ -244,12 +273,15 @@ fi
 PID=$!
 PSTART="$(ps -o lstart= -p "$PID" 2>/dev/null || true)"
 WSTART="$(ps -o lstart= -p "$$" 2>/dev/null || true)"
-T0=$(date +%s); record running
+T0=$(date +%s)
+if ! record running; then kill "$PID" 2>/dev/null; die "could not record running process"; fi
+release_builders
 
 # portable timeout (macOS has no coreutils timeout)
 ELAPSED=0
 while kill -0 "$PID" 2>/dev/null; do
   if (( ELAPSED >= TIMEOUT )); then
+    release_builders
     kill "$PID" 2>/dev/null; sleep 1; kill -9 "$PID" 2>/dev/null
     record timeout "$(( $(date +%s) - T0 ))"
     echo "claudex: timed out after ${TIMEOUT}s (effort=$EFFORT). Log tail:" >&2; tail -30 "$LOG" >&2

@@ -4,10 +4,10 @@
    claudex-runs.py cancel <root> [--keep-worktrees]
    claudex-runs.py count-running <root> <mode>
    claudex-runs.py budget <root> [--warn-only]
-   claudex-runs.py fingerprint <root>
+   claudex-runs.py fingerprint <dir>
    claudex-runs.py ack <root>
 """
-import hashlib, json, os, sys, time, signal, subprocess
+import hashlib, json, os, sys, time, signal, stat, subprocess
 
 def registry_root(directory, deadline=None):
     directory = os.path.realpath(directory)
@@ -42,7 +42,8 @@ def limits(root):
     return values
 
 def count_running(root, mode):
-    return sum(r["status"] == "running" and r["mode"] == mode and alive(r.get("pid"))
+    return sum(r["status"] == "running" and r["mode"] == mode
+               and matches_process(r.get("pid"), r.get("command", "codex"), r.get("pstart"))
                for r in load(root)[1].values())
 
 def budget(root, warn_only=False):
@@ -65,10 +66,39 @@ def git_bytes(root, *args, deadline=None):
     return subprocess.run(["git", "--no-optional-locks", "-C", root, *args],
                           capture_output=True, check=True, timeout=remaining(deadline)).stdout
 
-def fingerprint(root, deadline=None):
-    diff = git_bytes(root, "diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", *CHANGE_PATHS, deadline=deadline)
+def changes(root, deadline=None):
+    diff = git_bytes(root, "diff", "--relative", "--no-ext-diff", "--no-textconv", "HEAD", "--", *CHANGE_PATHS, deadline=deadline)
     untracked = git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *CHANGE_PATHS, deadline=deadline)
-    return hashlib.sha256(diff + b"\0" + untracked).hexdigest()
+    return diff, sorted(path for path in untracked.split(b"\0") if path)
+
+def normalize_text(data):
+    if b"\0" not in data:
+        try: data.decode("utf-8")
+        except UnicodeDecodeError: pass
+        else: return data.replace(b"\r\n", b"\n")
+    return data
+
+def fingerprint(root, deadline=None, snapshot=None):
+    diff, untracked = changes(root, deadline) if snapshot is None else snapshot
+    digest = hashlib.sha256(normalize_text(diff) + b"\0")
+    for path in untracked:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("fingerprint", 1.5)
+        filename = os.path.join(root, os.fsdecode(path))
+        info = os.lstat(filename)
+        digest.update(path + b"\0")
+        if info.st_size > 1024 * 1024 or not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+            digest.update(b"size:" + str(info.st_size).encode("ascii") + b"\0")
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            data = os.fsencode(os.readlink(filename))
+        else:
+            with open(filename, "rb") as f: data = f.read(1024 * 1024 + 1)
+            if len(data) > 1024 * 1024:  # file grew after stat
+                digest.update(b"size:" + str(os.path.getsize(filename)).encode("ascii") + b"\0")
+                continue
+        digest.update(b"sha256:" + hashlib.sha256(normalize_text(data)).hexdigest().encode("ascii") + b"\0")
+    return digest.hexdigest()
 
 def acknowledge(root, value=None):
     value = fingerprint(root) if value is None else value
@@ -84,20 +114,17 @@ def stop_hook(launcher):
         root = project_path(payload["cwd"], deadline)
         with open(os.path.join(root, "CLAUDE.md"), encoding="utf-8") as f:
             if "claudex-auto:start" not in f.read(): return
-        if not git_bytes(root, "status", "--porcelain", deadline=deadline): return
-        value = fingerprint(root, deadline)
+        snapshot = changes(root, deadline)
+        if not snapshot[0] and not snapshot[1]: return
+        value = fingerprint(root, deadline, snapshot)
         try:
             with open(os.path.join(root, ".claude", "claudex-logs", ".reviewed"), encoding="utf-8") as f:
                 if value in f.read().splitlines(): return
         except FileNotFoundError: pass
-        changed = git_bytes(root, "diff", "--relative", "--name-only", "-z", "HEAD", "--", *CHANGE_PATHS, deadline=deadline)
-        newest = 0
-        for path in changed.split(b"\0"):
-            if not path: continue
-            try: newest = max(newest, os.stat(os.path.join(root, os.fsdecode(path))).st_mtime)
-            except FileNotFoundError: pass  # deleted tracked files have no mtime
         runs = load(registry_root(root, deadline))[1]
-        if any(r["status"] == "done" and r["mode"] == "review" and r["ts"] > newest for r in runs.values()):
+        if any(r["status"] == "done" and r["mode"] == "review"
+               and r.get("scope") == "uncommitted" and r["dir"] == root
+               and r.get("fingerprint") == value for r in runs.values()):
             acknowledge(root, value)
             return
         # Quote for Bash, including spaces and shell metacharacters in project paths.
@@ -238,7 +265,7 @@ def cancel(root, keep):
         if r.get("status") != "running": continue
         # each target is verified on its own: a dead wrapper must not stop us from cancelling
         # a live codex child (which would otherwise keep working in a deleted worktree)
-        targets = [(r.get("pid"), "codex", r.get("pstart")), (r.get("wpid"), "claudex", r.get("wstart"))]
+        targets = [(r.get("pid"), r.get("command", "codex"), r.get("pstart")), (r.get("wpid"), "claudex", r.get("wstart"))]
         live = [t for t in targets if t[0] and alive(t[0])]
         verified = [t for t in live if matches_process(*t)]
         if not live or not verified:
@@ -259,7 +286,7 @@ def cancel(root, keep):
     for r in signalled:
         _, latest = load(root)
         if latest.get(r["id"], {}).get("status") not in ("running", "cancelled"): continue  # finished meanwhile
-        if alive(r.get("pid")) and matches_process(r["pid"], "codex", r.get("pstart")):
+        if matches_process(r.get("pid"), r.get("command", "codex"), r.get("pstart")):
             try: send_signal(r["pid"], getattr(signal, "SIGKILL", 9))
             except Exception: pass
     print(f"cancelled {killed} process(es)")

@@ -29,6 +29,12 @@ while [[ $# -gt 0 ]]; do
     shift 2
   else shift; fi
 done
+[[ -n "${STUB_EDIT:-}" ]] && printf 'edited during review\n' > "$STUB_EDIT"
+[[ -n "${STUB_STARTED:-}" ]] && printf '%s\n' "$$" >> "$STUB_STARTED"
+if [[ -n "${STUB_RELEASE:-}" ]]; then
+  deadline=$((SECONDS+20))
+  while [[ ! -f "$STUB_RELEASE" && $SECONDS -lt $deadline ]]; do sleep 0.1; done
+fi
 [[ -n "${STUB_LOG:-}" ]] && cat "$STUB_LOG"
 printf 'tokens used\n1,234\n'
 [[ "${STUB_FAIL:-0}" != 1 ]]
@@ -331,6 +337,12 @@ for model in ("test-mini", "test-nano"):
     out = setup()
     assert "codex model: " + model in out and "reviews/builds will be weaker" in out, out
     assert "auth.json present" in out
+# Force the regex fallback with invalid TOML as well as testing valid TOML.
+for prefix in ("", "legacy = unquoted\n"):
+    for value in ('"test-mini"', "'test-mini'", "test-mini"):
+        (codex_home / "config.toml").write_text(prefix + "model = " + value + " # inline comment\n[profiles.other]\nmodel = 'ignored'\n")
+        out = setup()
+        assert "codex model: test-mini\n" in out and "reviews/builds will be weaker" in out, out
 (home / ".codex").mkdir()
 (home / ".codex/config.toml").write_text('model = "strong-model"\n')
 out = setup(CODEX_HOME="")
@@ -359,6 +371,7 @@ warning = "claudex: budget warning — 61 min used in last 24h (budget 60)"
 assert "61 min used in last 24h (budget 60)" in out.stdout and out.stderr.strip() == warning, out
 assert cli(root, "status").stderr.strip() == warning
 for mode in ([], ["review"], ["build"]):
+    seed(root, events)  # prior stub durations must not change the expected warning
     result = run(["bash", wrapper, *mode, "-C", root, "test prompt"])
     assert warning in result.stderr, result
 conf = root / ".claude/claudex.conf"
@@ -370,7 +383,15 @@ assert m.limits(root) == dict(max_builders=4, budget_minutes=60)
 seed(root, [dict(id="equal", status="done", duration=3600, ts=now)])
 assert not cli(root, "budget").stderr  # only warn when exceeded
 
-seed(root, [dict(id="alive", status="running", mode="build", pid=os.getpid(), ts=now),
+identity = dict(command=m.ps_field(os.getpid(), "command") or "python", pstart=m.ps_field(os.getpid(), "lstart"))
+seed(root, [dict(id="unrelated", status="running", mode="build", pid=os.getpid(),
+                 command="codex", pstart="mismatched start", ts=now)])
+assert run([sys.executable, helper, "count-running", root, "build"]).stdout.strip() == "0"
+# Verify the start time independently of a command mismatch.
+seed(root, [dict(id="reused", status="running", mode="build", pid=os.getpid(),
+                 command=identity["command"], pstart="mismatched start", ts=now)])
+assert run([sys.executable, helper, "count-running", root, "build"]).stdout.strip() == "0"
+seed(root, [dict(id="alive", status="running", mode="build", pid=os.getpid(), ts=now, **identity),
             dict(id="dead", status="running", mode="build", pid=0, ts=now),
             dict(id="review", status="running", mode="review", pid=os.getpid(), ts=now),
             dict(id="finished", status="done", mode="build", pid=os.getpid(), ts=now)])
@@ -391,14 +412,55 @@ conf.write_text("max_builders=2\n")
 run(["bash", wrapper, "build", "-C", root, "test prompt"])
 # Defaults block four live builders, while reviews/exec remain allowed.
 conf.unlink()
-seed(root, [dict(id=str(i), status="running", mode="build", pid=os.getpid(), ts=now) for i in range(4)])
+seed(root, [dict(id=str(i), status="running", mode="build", pid=os.getpid(), ts=now, **identity) for i in range(4)])
 blocked = subprocess.run(["bash", str(wrapper), "build", "-C", str(root), "test prompt"], text=True, capture_output=True)
 assert blocked.returncode == 3 and "(4 running)" in blocked.stderr
 run(["bash", wrapper, "review", "-C", root])
 # Existing Windows probe is also the count-running probe.
-with patch.object(m.os, "name", "nt"), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as probe:
+with patch.object(m.os, "name", "nt"), patch.object(m, "ps_field", side_effect=lambda pid, field: identity["command" if field == "command" else "pstart"]), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as probe:
     assert m.count_running(root, "build") == 4
     assert all(call.args[0][:2] == ["bash", "-c"] for call in probe.call_args_list)
+
+# Six simultaneous requests contend for a single builder slot.
+seed(root, [])
+conf.write_text("max_builders=1\n")
+release = root / ".claude/release"
+started = root / ".claude/started"
+concurrent_env = dict(os.environ, STUB_RELEASE=str(release), STUB_STARTED=str(started))
+workers = []
+try:
+    for _ in range(6):
+        workers.append(subprocess.Popen(["bash", str(wrapper), "build", "-C", str(root), "concurrent"],
+                                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=concurrent_env))
+    deadline = time.monotonic() + 12
+    while sum(worker.poll() is not None for worker in workers) < 5 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert sum(worker.poll() == 3 for worker in workers) == 5, [worker.poll() for worker in workers]
+    assert len(started.read_text().splitlines()) == 1
+finally:
+    release.touch()
+    results = [worker.communicate(timeout=25) for worker in workers]
+assert sorted(worker.returncode for worker in workers) == [0, 3, 3, 3, 3, 3], results
+lock = root / ".claude/claudex-logs/.builders.lock"
+assert not lock.exists()
+# Recover stale locks, proceed with a warning on a busy lock, and release on timeout/early exit.
+lock.mkdir()
+os.utime(lock, (time.time() - 61, time.time() - 61))
+run(["bash", wrapper, "build", "-C", root, "stale lock"])
+assert not lock.exists()
+lock.mkdir()
+start = time.monotonic()
+result = run(["bash", wrapper, "build", "-C", root, "busy lock"])
+assert time.monotonic() - start < 8 and "proceeding without lock" in result.stderr
+assert lock.exists()  # a timed-out waiter never removes someone else's lock
+lock.rmdir()
+release.unlink()
+result = subprocess.run(["bash", str(wrapper), "build", "-t", "0", "-C", str(root), "timeout"],
+                        env=concurrent_env, text=True, capture_output=True, timeout=10)
+assert result.returncode == 124 and not lock.exists(), result
+conf.write_text("max_builders=0\n")
+result = subprocess.run(["bash", str(wrapper), "build", "-C", str(root), "blocked"], text=True, capture_output=True)
+assert result.returncode == 3 and not lock.exists(), result
 
 # Stop hook: silence in bypass cases, JSON only on block, shared fingerprint and review reuse.
 root = repo("hook project")
@@ -430,25 +492,51 @@ assert reviewed.read_text() == fingerprint
 (root / ".claudex-wt").mkdir()
 (root / ".claudex-wt/untracked").write_text("ignored")
 assert stop() == ""
-# Untracked file names with spaces and tracked diffs do.
+# Untracked file names and contents, and tracked diffs, invalidate acknowledgements.
 (root / "untracked file.txt").write_text("new")
+assert json.loads(stop())["decision"] == "block"
+cli(root, "ack")
+(root / "untracked file.txt").write_text("changed contents")
 assert json.loads(stop())["decision"] == "block"
 cli(root, "ack")
 tracked.write_text("changed again\n")
 assert json.loads(stop())["decision"] == "block"
 git(root, "add", "tracked file.txt")
 assert json.loads(stop())["decision"] == "block"  # staged diff is included
-mtime = int(time.time()) - 10
-os.utime(tracked, (mtime, mtime))
-seed(root, [dict(id="old-review", status="done", mode="review", ts=mtime-1),
-            dict(id="failed-review", status="failed", mode="review", ts=mtime+1),
-            dict(id="builder", status="done", mode="build", ts=mtime+1)])
-assert json.loads(stop())["decision"] == "block"
-seed(root, [dict(id="review", status="done", mode="review", ts=int(time.time())+1)])
-assert stop() == ""
+value = m.fingerprint(str(root))
+matching = dict(id="review", status="done", mode="review", ts=1,
+                dir=str(root.resolve()), scope="uncommitted", fingerprint=value)
+for overrides in (dict(fingerprint="old"), dict(status="failed"), dict(mode="build"),
+                  dict(dir=str(base)), dict(scope="commit"), dict(scope="base"), dict(scope=None)):
+    seed(root, [dict(matching, **overrides)])
+    assert json.loads(stop())["decision"] == "block", overrides
+seed(root, [matching])
+assert stop() == ""  # matching content counts regardless of timestamps
 assert reviewed.read_text() == run([sys.executable, helper, "fingerprint", root]).stdout
 seed(root, [])
 assert stop() == ""  # successful review cached its fingerprint
+# Real wrapper records scope and the START fingerprint, even when review changes a file.
+for scope in ([], ["--base", "HEAD"], ["--commit", "HEAD"]):
+    before = m.fingerprint(str(root))
+    run(["bash", wrapper, "review", "-C", root, *scope])
+    event = list(m.load(str(root))[1].values())[-1]
+    assert event["scope"] == (scope[0][2:] if scope else "uncommitted"), event
+    assert event["fingerprint"] == before and event["dir"] == str(root.resolve()), event
+before = m.fingerprint(str(root))
+run(["bash", wrapper, "review", "-C", root], env=dict(os.environ, STUB_EDIT=str(tracked)))
+event = list(m.load(str(root))[1].values())[-1]
+assert event["fingerprint"] == before != m.fingerprint(str(root)), event
+assert json.loads(stop())["decision"] == "block"
+# Excluded changes are silent even without acknowledgement or a review record.
+excluded = repo("excluded-only")
+(excluded / ".claude").mkdir()
+settings = excluded / ".claude/settings.json"
+settings.write_text("{}")
+git(excluded, "add", "-f", ".claude/settings.json")
+git(excluded, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "tracked settings")
+settings.write_text('{"changed": true}')
+(excluded / ".claude/untracked").write_text("ignored")
+assert stop(directory=excluded) == ""
 nonrepo = base / "not-git"
 nonrepo.mkdir()
 (nonrepo / "CLAUDE.md").write_text("<!-- claudex-auto:start -->\n")
@@ -459,7 +547,7 @@ assert not run(["bash", hook], input="invalid json").stdout
 with patch.object(m.os, "name", "nt"), patch.object(m.os.path, "realpath", side_effect=lambda p: p), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "C:/project with spaces\n")) as convert:
     assert m.project_path("/c/project with spaces") == "C:/project with spaces"
     assert convert.call_args.args[0] == ["cygpath", "-m", "/c/project with spaces"]
-# A project enabled from a repository subdirectory uses relative tracked paths for mtimes.
+# A project enabled from a repository subdirectory fingerprints paths relative to that directory.
 sub = root / "subproject"
 sub.mkdir()
 (sub / "CLAUDE.md").write_text("<!-- claudex-auto:start -->\n")
@@ -469,8 +557,49 @@ git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "subproj
 (sub / "file.txt").write_text("modified")
 seed(root, [dict(id="old", status="done", mode="review", ts=int(time.time())-60)])
 assert json.loads(stop(directory=sub))["decision"] == "block"
-seed(root, [dict(id="new", status="done", mode="review", ts=int(time.time())+1)])
+(sub / "untracked.txt").write_text("sub contents")
+seed(root, [dict(matching, dir=str(sub.resolve()), fingerprint=m.fingerprint(str(sub)))])
 assert stop(directory=sub) == ""
+# Linked worktrees share the registry, but fingerprint their own tracked and untracked files.
+linked = base / "hook-linked"
+git(root, "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+try:
+    (linked / "tracked file.txt").write_text("linked change")
+    (linked / "untracked file.txt").write_text("linked contents")
+    linked_value = m.fingerprint(str(linked))
+    assert linked_value != m.fingerprint(str(root))
+    seed(root, [dict(matching, fingerprint=linked_value)])
+    assert json.loads(stop(directory=linked))["decision"] == "block"
+    run(["bash", wrapper, "review", "-C", linked])
+    assert stop(directory=linked) == ""
+    (linked / "untracked file.txt").write_text("linked contents changed")
+    assert json.loads(stop(directory=linked))["decision"] == "block"
+finally: git(root, "worktree", "remove", "--force", str(linked))
+# Deterministic text normalization, binary hashing, unusual paths and the 1 MiB cutoff.
+content = repo("fingerprint-content")
+untracked = content / ("space and newline.txt" if os.name == "nt" else "space and\nnewline.txt")
+untracked.write_bytes(b"one\r\ntwo\r\n")
+value = m.fingerprint(str(content))
+untracked.write_bytes(b"one\ntwo\n")
+assert m.fingerprint(str(content)) == value
+untracked.write_bytes(b"binary\0\r\n")
+value = m.fingerprint(str(content))
+untracked.write_bytes(b"binary\0\n")
+assert m.fingerprint(str(content)) != value
+large = content / "large.bin"
+large.write_bytes(b"a" * (1024 * 1024))
+value = m.fingerprint(str(content))
+large.write_bytes(b"b" * (1024 * 1024))
+assert m.fingerprint(str(content)) != value  # exactly 1 MiB still hashes contents
+large.write_bytes(b"a" * (1024 * 1024 + 1))
+value = m.fingerprint(str(content))
+large.write_bytes(b"b" * (1024 * 1024 + 1))
+assert m.fingerprint(str(content)) == value
+large.write_bytes(b"b" * (1024 * 1024 + 2))
+assert m.fingerprint(str(content)) != value
+value = m.fingerprint(str(content))
+large.rename(content / "renamed.bin")
+assert m.fingerprint(str(content)) != value
 manifest = json.loads((here.parent / "hooks/hooks.json").read_text())
 assert manifest == {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": '"${CLAUDE_PLUGIN_ROOT}/scripts/claudex-hook-stop"', "timeout": 20}]}]}}
 PY

@@ -68,10 +68,23 @@ home = sys.argv[1]
 model = None
 try:
     with open(os.path.join(home, "config.toml"), encoding="utf-8") as f:
-        for line in f:
+        config = f.read()
+    try:
+        import tomllib
+    except ImportError:
+        tomllib = None
+    try:
+        parsed = tomllib.loads(config) if tomllib else None
+    except ValueError:
+        parsed = None  # older/loose configs can contain unquoted model names
+    if parsed is not None:
+        model = parsed.get("model")
+        if not isinstance(model, str): model = None
+    else:
+        for line in config.splitlines():
             if line.lstrip().startswith("["): break  # only the top-level model
-            match = re.match(r'^\s*model\s*=\s*"([^"]*)"', line)
-            if match: model = match.group(1)
+            match = re.match(r'''^\s*model\s*=\s*(?:"([^"]*)"|'([^']*)'|([^#\s]+))\s*(?:#.*)?$''', line)
+            if match: model = next(value for value in match.groups() if value is not None)
 except OSError: pass
 print("  codex model: " + (model or "default (not set)"))
 if model and any(name in model.lower() for name in ("mini", "nano")):
