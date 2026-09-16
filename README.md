@@ -12,7 +12,12 @@ ASTRA = OpenAI Codex used as an independent second model around Claude Code.
 /plugin marketplace add matiashendengroth/astra-plugin
 /plugin install astra@matias
 ```
-Update later with `/plugin update astra`.
+## Update
+```
+/plugin marketplace update matias
+/plugin update astra
+```
+then restart Claude Code. Projects keep working without any re-setup, because the launcher resolves the newest version. If a release note says the CLAUDE.md rule changed, run `/astra-auto` again in the project to refresh the block in place.
 
 ## Automatic use (recommended)
 Restart Claude Code once after installing so the plugin's commands appear. Then, in a project, run `/astra-auto` once. It adds a rule to `CLAUDE.md` making Claude the orchestrator and ASTRA the builder: Claude classifies each task, writes specs, runs `astra build` (in parallel git worktrees for large tasks), merges, tests, has ASTRA review the diff, and verifies every finding. Trivial edits stay with Claude. It also installs a stable launcher at `~/.local/bin/astra` (which resolves the newest installed plugin version, so plugin updates need no re-run), adds the permission rule, and gitignores the logs. `/astra-auto off` reverses it.
