@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# astra — run one headless ASTRA (OpenAI Codex) pass and print only its final answer.
+# claudex — run one headless CLAUDEX (OpenAI Codex) pass and print only its final answer.
 #
-#   astra [opts] "prompt"                 prompt as argument
-#   echo "prompt" | astra [opts]          prompt from stdin
-#   astra review [opts] [--uncommitted|--base BR|--commit SHA] ["focus"]
-#   astra build [opts] "spec"             implement a spec in DIR (workspace-write, effort default high,
+#   claudex [opts] "prompt"                 prompt as argument
+#   echo "prompt" | claudex [opts]          prompt from stdin
+#   claudex review [opts] [--uncommitted|--base BR|--commit SHA] ["focus"]
+#   claudex build [opts] "spec"             implement a spec in DIR (workspace-write, effort default high,
 #                                         timeout default 1200). Prints what it changed.
 #
 # Options
@@ -13,17 +13,17 @@
 #              default: read-only for exec, workspace-write for review (so it can run tests)
 #   -m MODEL   model override (default from ~/.codex/config.toml)
 #   -e EFFORT  reasoning effort minimal|low|medium|high|xhigh
-#              default: $ASTRA_EFFORT > .claude/astra.conf effort= > low (exec) / medium (review) / high (build)
-#              mode-specific: $ASTRA_REVIEW_EFFORT / $ASTRA_BUILD_EFFORT, review_effort= / build_effort=
-#   -t SECS    timeout (default $ASTRA_TIMEOUT or 480; build: $ASTRA_BUILD_TIMEOUT or 1200).
+#              default: $CLAUDEX_EFFORT > .claude/claudex.conf effort= > low (exec) / medium (review) / high (build)
+#              mode-specific: $CLAUDEX_REVIEW_EFFORT / $CLAUDEX_BUILD_EFFORT, review_effort= / build_effort=
+#   -t SECS    timeout (default $CLAUDEX_TIMEOUT or 480; build: $CLAUDEX_BUILD_TIMEOUT or 1200).
 #   --json     review only: return findings as JSON matching scripts/review-schema.json
 #   -v         verbose: print the full Codex transcript (commands run, file edits, reasoning
 #              summaries) before the final answer, so it is visible in the caller's transcript
 #
-# Transcripts go to .claude/astra-logs/ in the project (last 40 kept).
+# Transcripts go to .claude/claudex-logs/ in the project (last 40 kept).
 set -uo pipefail
 
-die() { echo "astra: $*" >&2; exit 2; }
+die() { echo "claudex: $*" >&2; exit 2; }
 command -v codex >/dev/null 2>&1 || die "codex CLI not found. Install: npm i -g @openai/codex  then run: codex  (to log in)"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -50,26 +50,26 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -d "$DIR" ]] || die "no such directory: $DIR"
 DIR="$(cd "$DIR" && pwd -P)"
-CONF="$DIR/.claude/astra.conf"
+CONF="$DIR/.claude/claudex.conf"
 conf() { [[ -f "$CONF" ]] && sed -n "s/^$1=//p" "$CONF" | tail -1; }
 
 # sandbox default per mode
 if [[ -z "$SANDBOX" ]]; then
-  if [[ "$MODE" == "review" ]]; then SANDBOX="${ASTRA_REVIEW_SANDBOX:-$(conf review_sandbox)}"; SANDBOX="${SANDBOX:-workspace-write}"
+  if [[ "$MODE" == "review" ]]; then SANDBOX="${CLAUDEX_REVIEW_SANDBOX:-$(conf review_sandbox)}"; SANDBOX="${SANDBOX:-workspace-write}"
   elif [[ "$MODE" == "build" ]]; then SANDBOX="workspace-write"
   else SANDBOX="read-only"; fi
 fi
 if [[ -z "$TIMEOUT" ]]; then
-  [[ "$MODE" == "build" ]] && TIMEOUT="${ASTRA_BUILD_TIMEOUT:-$(conf build_timeout)}"
-  [[ -z "$TIMEOUT" ]] && TIMEOUT="${ASTRA_TIMEOUT:-$(conf timeout)}"
+  [[ "$MODE" == "build" ]] && TIMEOUT="${CLAUDEX_BUILD_TIMEOUT:-$(conf build_timeout)}"
+  [[ -z "$TIMEOUT" ]] && TIMEOUT="${CLAUDEX_TIMEOUT:-$(conf timeout)}"
   TIMEOUT="${TIMEOUT:-480}"
 fi
 
 # effort: flag > env > conf > default (review has its own chain, falling back to the general one)
 if [[ -z "$EFFORT" ]]; then
-  if [[ "$MODE" == "review" ]]; then EFFORT="${ASTRA_REVIEW_EFFORT:-$(conf review_effort)}"; fi
-  if [[ "$MODE" == "build" ]]; then EFFORT="${ASTRA_BUILD_EFFORT:-$(conf build_effort)}"; fi
-  [[ -z "$EFFORT" ]] && EFFORT="${ASTRA_EFFORT:-$(conf effort)}"
+  if [[ "$MODE" == "review" ]]; then EFFORT="${CLAUDEX_REVIEW_EFFORT:-$(conf review_effort)}"; fi
+  if [[ "$MODE" == "build" ]]; then EFFORT="${CLAUDEX_BUILD_EFFORT:-$(conf build_effort)}"; fi
+  [[ -z "$EFFORT" ]] && EFFORT="${CLAUDEX_EFFORT:-$(conf effort)}"
   if [[ -z "$EFFORT" ]]; then case "$MODE" in review) EFFORT=medium ;; build) EFFORT=high ;; *) EFFORT=low ;; esac; fi
 fi
 case "$EFFORT" in minimal|low|medium|high|xhigh) ;; *) die "bad effort '$EFFORT' (minimal|low|medium|high|xhigh)" ;; esac
@@ -79,7 +79,7 @@ PROMPT="${*:-}"
 if [[ -z "$PROMPT" && "$MODE" != "review" && ! -t 0 ]]; then IFS= read -r -t 3 -d '' PROMPT || true; fi
 [[ "$MODE" != "review" && -z "$PROMPT" ]] && die "no prompt given"
 
-LOG_DIR="${ASTRA_LOG_DIR:-$DIR/.claude/astra-logs}"; mkdir -p "$LOG_DIR"; LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
+LOG_DIR="${CLAUDEX_LOG_DIR:-$DIR/.claude/claudex-logs}"; mkdir -p "$LOG_DIR"; LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
 ls -t "$LOG_DIR" 2>/dev/null | tail -n +81 | while read -r f; do rm -f "$LOG_DIR/$f"; done   # keep last 40 runs (log+last)
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"; OUT="$LOG_DIR/$STAMP.last.md"; LOG="$LOG_DIR/$STAMP.log"
 
@@ -96,7 +96,7 @@ if [[ "$MODE" == "review" ]]; then
       --base) SCOPE="the changes on this branch relative to base branch ${REVIEW_ARGS[1]} (git diff ${REVIEW_ARGS[1]}...HEAD)" ;;
       --commit) SCOPE="the changes introduced by commit ${REVIEW_ARGS[1]} (git show ${REVIEW_ARGS[1]})" ;;
     esac
-    SCOPE="$SCOPE. Ignore .claude/astra-logs/"
+    SCOPE="$SCOPE. Ignore .claude/claudex-logs/"
     [[ "$SANDBOX" != "read-only" ]] && SCOPE="$SCOPE. You may run the project's tests/build to verify"
     TEXT="Review $SCOPE. ${PROMPT:-Be adversarial: bugs, regressions, missed edge cases. Rank by severity.}"
     if [[ $JSON -eq 1 ]]; then
@@ -128,8 +128,8 @@ ELAPSED=0
 while kill -0 "$PID" 2>/dev/null; do
   if (( ELAPSED >= TIMEOUT )); then
     kill "$PID" 2>/dev/null; sleep 1; kill -9 "$PID" 2>/dev/null
-    echo "astra: timed out after ${TIMEOUT}s (effort=$EFFORT). Log tail:" >&2; tail -30 "$LOG" >&2
-    echo "[astra log: $LOG]" >&2; exit 124
+    echo "claudex: timed out after ${TIMEOUT}s (effort=$EFFORT). Log tail:" >&2; tail -30 "$LOG" >&2
+    echo "[claudex log: $LOG]" >&2; exit 124
   fi
   sleep 1; ELAPSED=$((ELAPSED+1))
 done
@@ -137,12 +137,12 @@ wait "$PID"; RC=$?
 
 if [[ -s "$OUT" ]]; then
   if [[ $VERBOSE -eq 1 ]]; then
-    echo "===== ASTRA TRANSCRIPT ($MODE, effort=$EFFORT) ====="
+    echo "===== CLAUDEX TRANSCRIPT ($MODE, effort=$EFFORT) ====="
     # print the transcript up to the token count; codex repeats the final answer after it
     awk '/^tokens used$/{exit} {print}' "$LOG"
-    echo "===== ASTRA FINAL ANSWER ====="
+    echo "===== CLAUDEX FINAL ANSWER ====="
   fi
-  cat "$OUT"; echo; echo "[astra log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
+  cat "$OUT"; echo; echo "[claudex log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
 else
-  echo "astra: no final message produced (exit $RC). Log tail:" >&2; tail -40 "$LOG" >&2; exit 1
+  echo "claudex: no final message produced (exit $RC). Log tail:" >&2; tail -40 "$LOG" >&2; exit 1
 fi

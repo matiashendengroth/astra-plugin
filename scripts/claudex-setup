@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# claudex-setup <project-dir> [on|off]  — one-shot, idempotent setup of automatic CLAUDEX delegation.
+#   on : install stable launcher (~/.local/bin/claudex), write/refresh the CLAUDE.md rule block,
+#        add the permission allow rule, gitignore logs + worktrees.
+#   off: remove the rule block and permission entries (launcher and .gitignore left alone).
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+DIR="${1:?usage: claudex-setup <project-dir> [on|off]}"; ACTION="${2:-on}"
+[[ -d "$DIR" ]] || { echo "claudex-setup: no such directory: $DIR" >&2; exit 2; }
+DIR="$(cd "$DIR" && pwd -P)"
+LAUNCHER="$HOME/.local/bin/claudex"
+CLAUDE_MD="$DIR/CLAUDE.md"; SETTINGS="$DIR/.claude/settings.local.json"; IGNORE="$DIR/.gitignore"
+START='<!-- claudex-auto:start -->'; END='<!-- claudex-auto:end -->'
+LEGACY_START='<!-- astra-auto:start -->'; LEGACY_END='<!-- astra-auto:end -->'
+
+strip_block() {  # remove existing (and legacy astra-named) block from CLAUDE.md if present
+  [[ -f "$CLAUDE_MD" ]] || return 0
+  python3 - "$CLAUDE_MD" "$START" "$END" "$LEGACY_START" "$LEGACY_END" <<'PY'
+import re,sys; p,a,b,la,lb=sys.argv[1:]; s=open(p).read()
+for x,y in ((a,b),(la,lb)):
+    s=re.sub(r'\n*'+re.escape(x)+r'.*?'+re.escape(y)+r'\n?', '\n', s, flags=re.S)
+s=s.rstrip('\n'); open(p,'w').write(s+'\n' if s else '')
+PY
+  [[ -f "$DIR/.claude/astra.conf" && ! -f "$DIR/.claude/claudex.conf" ]] && mv "$DIR/.claude/astra.conf" "$DIR/.claude/claudex.conf"
+  return 0
+}
+edit_perms() {  # $1 = add|remove
+  mkdir -p "$(dirname "$SETTINGS")"
+  python3 - "$SETTINGS" "$LAUNCHER" "$1" <<'PY'
+import json,os,sys; p,l,op=sys.argv[1:]
+s=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
+a=s.setdefault("permissions",{}).setdefault("allow",[])
+a=[r for r in a if not (("plugins/cache" in r and ("scripts/astra" in r or "scripts/claudex" in r)) or r==f"Bash({l}:*)" or r.endswith("/.local/bin/astra:*)") or ".claude/bin/astra" in r)]
+if op=="add": a.append(f"Bash({l}:*)")
+s["permissions"]["allow"]=a; json.dump(s,open(p,"w"),indent=2); open(p,"a").write("\n")
+PY
+}
+
+if [[ "$ACTION" == "off" ]]; then
+  strip_block; edit_perms remove
+  echo "CLAUDEX auto-delegation removed from $DIR"; exit 0
+fi
+
+[[ "$ACTION" == "on" ]] || { echo "claudex-setup: action must be on|off" >&2; exit 2; }
+command -v codex >/dev/null 2>&1 || echo "warning: codex CLI not found. Install: npm i -g @openai/codex ; then run: codex" >&2
+
+# 1. stable launcher
+mkdir -p "$(dirname "$LAUNCHER")"; cp "$HERE/claudex-launcher" "$LAUNCHER"; chmod +x "$LAUNCHER"
+CHECK="$("$LAUNCHER" -e turbo x 2>&1 || true)"   # wrapper exits 2 on purpose; we only need its text
+if [[ "$CHECK" != *"bad effort"* ]]; then
+  echo "claudex-setup: launcher cannot find an installed claudex plugin; run /plugin install claudex@gryd first" >&2; exit 1
+fi
+
+# 2. CLAUDE.md rule (refresh in place)
+REFRESH=0; [[ -f "$CLAUDE_MD" ]] && grep -q "$START" "$CLAUDE_MD" && REFRESH=1
+strip_block
+[[ -f "$CLAUDE_MD" && -s "$CLAUDE_MD" ]] && printf '\n' >> "$CLAUDE_MD"
+sed "s#WRAPPER#$LAUNCHER#g" "$HERE/auto-rule.md" >> "$CLAUDE_MD"
+
+# 3. permission
+edit_perms add
+
+# 4. gitignore
+touch "$IGNORE"
+grep -q '^\.claude/claudex-logs/' "$IGNORE" || printf '\n# CLAUDEX (Codex) transcripts and build worktrees\n.claude/claudex-logs/\n' >> "$IGNORE"
+grep -q '^\.claudex-wt/' "$IGNORE" || echo ".claudex-wt/" >> "$IGNORE"
+
+[[ $REFRESH -eq 1 ]] && echo "CLAUDEX auto-delegation refreshed in $DIR" || echo "CLAUDEX auto-delegation enabled in $DIR"
+echo "launcher: $LAUNCHER  (takes effect in new sessions)"

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Stable entry point for CLAUDEX. Installed to ~/.local/bin/claudex by /claudex-auto.
+# Resolves the newest installed claudex plugin at call time so plugin updates never break
+# CLAUDE.md rules or permission entries that reference this path.
+set -u
+if [[ -n "${CLAUDEX_WRAPPER:-}" && -x "$CLAUDEX_WRAPPER" ]]; then exec "$CLAUDEX_WRAPPER" "$@"; fi
+CACHE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache"
+LATEST=""
+for d in "$CACHE"/*/claudex/*/scripts/claudex; do
+  [[ -x "$d" ]] || continue
+  v="$(basename "$(dirname "$(dirname "$d")")")"
+  if [[ -z "$LATEST" ]] || [[ "$(printf '%s\n%s\n' "$LATEST_V" "$v" | sort -V | tail -1)" == "$v" ]]; then LATEST="$d"; LATEST_V="$v"; fi
+done
+[[ -n "$LATEST" ]] || { echo "claudex: no installed claudex plugin found under $CACHE. Run: /plugin install claudex@gryd" >&2; exit 2; }
+exec "$LATEST" "$@"

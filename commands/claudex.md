@@ -1,16 +1,16 @@
 ---
-description: Claude ⇄ ASTRA pipeline — architect, parallel ASTRA passes, reconcile + implement, ASTRA adversarial review, final verify
+description: Claude ⇄ CLAUDEX pipeline — architect, parallel CLAUDEX passes, reconcile + implement, CLAUDEX adversarial review, final verify
 argument-hint: <task>
 ---
 
-Run the full ASTRA pipeline on: **$ARGUMENTS**
+Run the full CLAUDEX pipeline on: **$ARGUMENTS**
 
-Analysis passes: call the wrapper directly (`~/.local/bin/astra -C "<abs dir>" "<question>"`, background Bash, timeout 600000; pipe long prompts from a file). The review goes through the `astra` subagent (Agent tool, subagent_type `astra:astra`, run_in_background: true) so it shows as a named agent.
+Analysis passes: call the wrapper directly (`~/.local/bin/claudex -C "<abs dir>" "<question>"`, background Bash, timeout 600000; pipe long prompts from a file). The review goes through the `claudex` subagent (Agent tool, subagent_type `claudex:claudex`, run_in_background: true) so it shows as a named agent.
 
 ## 1 · Claude — architect
 Read the relevant code. Write a brief (goal, constraints, files in play, open questions) to the scratchpad as `brief.md`. Decide the size: **small** (1 file, local change), **medium** (2–4 files, contained), **large** (new feature, refactor, cross-cutting, unclear bug).
 
-## 2 · ASTRA — parallel passes, scaled to size
+## 2 · CLAUDEX — parallel passes, scaled to size
 Start the runs in ONE message as background Bash jobs, each fed the brief plus one angle, then wait for all:
 - small → skip this stage.
 - medium → **Risk** only: everything that could break; edge cases, regressions, hidden coupling, tests needed.
@@ -19,9 +19,9 @@ Start the runs in ONE message as background Bash jobs, each fed the brief plus o
 ## 3 · Claude — reconcile + implement
 Where do the passes agree, where do they conflict, what do you decide and why. Implement it yourself. Run tests/build.
 
-## 4 · ASTRA — adversarial review (all sizes)
-Spawn one `astra` agent: "review: <absolute dir>. Violations of this brief count as findings: <brief>". Read the RESULT file it names.
+## 4 · CLAUDEX — adversarial review (all sizes)
+Spawn one `claudex` agent: "review: <absolute dir>. Violations of this brief count as findings: <brief>". Read the RESULT file it names.
 Review runs at its own effort (default medium) with a workspace-write sandbox so it can run the tests.
 
 ## 5 · Claude — final verify
-For each JSON finding: open the file/line, confirm or refute against the code. Never accept on faith. Fix confirmed ones, re-run tests. Report: what was built, where ASTRA agreed/disagreed, each finding as confirmed/rejected with a reason, test results.
+For each JSON finding: open the file/line, confirm or refute against the code. Never accept on faith. Fix confirmed ones, re-run tests. Report: what was built, where CLAUDEX agreed/disagreed, each finding as confirmed/rejected with a reason, test results.

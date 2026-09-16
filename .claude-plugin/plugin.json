@@ -1,12 +1,12 @@
 {
-  "name": "astra",
-  "description": "Claude orchestrates, ASTRA (OpenAI Codex) builds and reviews. Claude classifies each task, writes specs, runs Codex builders in parallel git worktrees, merges, tests, gets an adversarial JSON review from Codex, and verifies every finding. One command to enable per project.",
-  "version": "0.5.0",
+  "name": "claudex",
+  "description": "Claude orchestrates, CLAUDEX (OpenAI Codex) builds and reviews. Claude classifies each task, writes specs, runs Codex builders in parallel git worktrees, merges, tests, gets an adversarial JSON review from Codex, and verifies every finding. One command to enable per project.",
+  "version": "1.0.0",
   "author": {
     "name": "Matias Henden"
   },
-  "homepage": "https://github.com/matiashendengroth/astra-plugin",
-  "repository": "https://github.com/matiashendengroth/astra-plugin",
+  "homepage": "https://github.com/matiashendengroth/claudex",
+  "repository": "https://github.com/matiashendengroth/claudex",
   "license": "MIT",
   "keywords": [
     "codex",

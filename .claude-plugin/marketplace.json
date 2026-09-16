@@ -8,9 +8,9 @@
   },
   "plugins": [
     {
-      "name": "astra",
+      "name": "claudex",
       "source": "./",
-      "description": "Claude orchestrates, ASTRA (OpenAI Codex) builds and reviews. Parallel builders in git worktrees, adversarial JSON reviews, one-command setup."
+      "description": "Claude orchestrates, CLAUDEX (OpenAI Codex) builds and reviews. Parallel builders in git worktrees, adversarial JSON reviews, one-command setup."
     }
   ]
 }
