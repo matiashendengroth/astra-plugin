@@ -23,7 +23,7 @@ Where do the passes agree, where do they conflict, what do you decide and why. I
 Spawn one `claudex` agent: "review: <absolute dir>. Violations of this brief count as findings: <brief>". Read the RESULT file it names.
 Review runs at its own effort (default medium) with a workspace-write sandbox so it can run the tests.
 
-Judge the review by its coverage. Treat an empty findings list as low-confidence when measured.tests_detected is false or coverage.confidence is low or exec_count < 3; in that case either rerun the review at -e high, or read the diff yourself before reporting. State the coverage in your report.
+Judge review coverage by `measured.tests_detected` OR `measured.executed`; an empty review with neither is low-confidence. Also treat an empty findings list as low-confidence when `coverage.confidence` is low or `measured.exec_count` < 3; in that case either rerun the review at `-e high`, or read the diff yourself before reporting. State the coverage in your report.
 
 ## 5 · Claude — final verify
 For each JSON finding: open the file/line, confirm or refute against the code. Never accept on faith. Fix confirmed ones, re-run tests. Report: what was built, where CLAUDEX agreed/disagreed, each finding as confirmed/rejected with a reason, test results.
