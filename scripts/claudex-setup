@@ -110,3 +110,4 @@ grep -q '^\.claudex-wt/' "$IGNORE" || echo ".claudex-wt/" >> "$IGNORE"
 
 [[ $REFRESH -eq 1 ]] && echo "CLAUDEX auto-delegation refreshed in $DIR" || echo "CLAUDEX auto-delegation enabled in $DIR"
 echo "launcher: $LAUNCHER  (takes effect in new sessions)"
+echo "hooks: Stop (review reminder), PostToolUse (edit tracking) — active in this project"

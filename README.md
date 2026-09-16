@@ -55,7 +55,7 @@ From the next session on, Claude delegates on its own:
 | unclear bug | CLAUDEX analysis → build with the diagnosis |
 | after any build | tests → CLAUDEX JSON review → Claude confirms/refutes each finding |
 
-Results are left uncommitted for you.
+Single-chunk builds remain uncommitted. For parallel builds, the merge command commits the chunk worktrees and merges their branches; subsequent verification fixes remain uncommitted.
 
 ## Commands
 
@@ -63,10 +63,15 @@ Results are left uncommitted for you.
 |---|---|
 | `/claudex-auto [on\|off]` | enable / disable automatic delegation in this project |
 | `/claudex-build <task>` | force the build flow on one task |
+| `/claudex-build --dry-run <task>` | print the brief's chunk specs verbatim with owned files, estimate builders and effort; stop before creating worktrees or builders |
 | `/claudex <task>` | advisory flow: Claude writes the code, CLAUDEX advises and reviews |
 | `/claudex-effort [review\|build] <level>` | set Codex reasoning effort (minimal, low, medium, high, xhigh) |
 | `/claudex-status` | running builders/reviews, recent runs with duration and tokens, build worktrees |
+| `/claudex-budget` | show this project's budget usage and limits |
+| `/claudex-merge` | commit build worktrees and merge their `claudex/` branches; exit 4 means conflicts remain |
 | `/claudex-cancel [--keep-worktrees]` | stop every running CLAUDEX process and clean up worktrees and branches |
+
+See [Writing specs for CLAUDEX builders](docs/SPECS.md) for ownership, shared interfaces, acceptance criteria, and examples. If merge exits 4, the orchestrator resolves the listed conflicts in the remaining worktree(s) and re-runs merge.
 
 ## Reasoning effort and timeouts
 
@@ -82,17 +87,25 @@ Results are left uncommitted for you.
 
 `scripts/claudex` is a plain bash script around `codex exec`. Modes: default (question), `review`, `build`. Useful flags: `-C DIR`, `-e EFFORT`, `-t SECS`, `-v` (full transcript), `--json` (structured review), `-w` / `--ro` (sandbox). Transcripts persist in `.claude/claudex-logs/` (last 40 runs).
 
-JSON reviews report `coverage`: files actually opened, commands run, whether tests ran, their result, and confidence with a reason. The wrapper independently measures transcript `exec_count`, `tests_detected`, and `patched` (distinct paths in apply-patch blocks). Valid JSON output includes these under `measured`; plain reviews and invalid JSON get `[claudex coverage: exec=N tests=yes|no patched=K]`. The existing log-path footer remains; remove it before parsing JSON (and omit `-v`). For JSON reviews the saved `.last.md` (the RESULT file the relay returns) is the merged document; the model's untouched answer is kept next to it as `.raw.md`. Review done/failed registry events include the measured fields, and detected patches trigger a warning. Test detection indicates a matching command, not a passing result.
+JSON reviews report `coverage`: files actually opened, commands run, whether tests ran, whether code was executed (`executed`), test result, and confidence with a reason. The wrapper independently measures transcript `exec_count`, `tests_detected`, `executed`, and `patched` (distinct paths in apply-patch blocks) under `measured`. The log-path footer remains; remove it before parsing JSON (and omit `-v`). For JSON reviews the saved `.last.md` (the RESULT file the relay returns) is the merged document; the model's untouched answer is kept next to it as `.raw.md`. Review done/failed registry events include the measured fields, and detected patches trigger a warning. Test detection indicates a matching command, not a passing result.
 
-Treat empty findings as low-confidence when no tests were detected, the model reports low confidence, or fewer than three exec calls were measured. Rerun at `-e high` or read the diff yourself, and state the coverage in your report.
+Judge review coverage by `measured.tests_detected` OR `measured.executed`; empty findings with neither are low-confidence. Low reported confidence or fewer than three exec calls also warrant rerunning at `-e high` or reading the diff yourself. State the coverage in your report.
+
+### Build reports
+
+Builds return JSON with `summary`, `files_changed`, `commands_run`, `tests_run`, `test_result`, `assumptions`, `left_undone`, and `needs_attention`, plus the wrapper's `measured` object (`exec_count`, `tests_detected`, `executed`, `patched`). The relay returns the report verbatim. After each build, Claude checks `needs_attention` and `left_undone` as findings and notes any discrepancy when `tests_run` is true but `measured.tests_detected` is false.
 
 The run registry lives in the main worktree, so `status` and `cancel` also work from linked worktrees and subdirectories. Cancellation checks process identity and marks mismatches as stale. Cleanup only removes worktrees inside the main worktree's `.claudex-wt/` whose branches start with `claudex/`.
 
 ### Budgets and review reminder
 
-Configure `max_builders` (default 4) and `budget_minutes` (default 60) in the main worktree's `.claude/claudex.conf`. A build exits with code 3 when that root already has the maximum number of live builders. Other run modes remain available. The minutes budget sums durations of done/failed/timeout/cancelled runs whose final timestamp is in the last 24 hours; exceeding it warns at every run start and in `claudex status`, without blocking. `claudex budget -C "<dir>"` prints usage and limit. Before large builds, Claude checks the budget and asks before starting more builders when over budget. Limits accept nonnegative integers; invalid values are ignored.
+Configure `max_builders` (default 4) and `budget_minutes` (default 60) in the main worktree's `.claude/claudex.conf`. A build exits with code 3 when that root already has the maximum number of live builders. Other run modes remain available. The minutes budget sums durations of done/failed/timeout/cancelled runs whose final timestamp is in the last 24 hours; exceeding it warns at every run start and in `claudex status`, without blocking. `/claudex-budget` (or `claudex budget -C "<dir>"`) prints usage and limit. Before large builds, Claude checks the budget and asks before starting more builders when over budget. Limits accept nonnegative integers; invalid values are ignored.
 
 The plugin's Stop hook reminds Claude to review uncommitted changes in projects enabled with `/claudex-auto`. A completed review newer than the changed tracked files satisfies the reminder. Otherwise it blocks stopping with instructions to run a review and verify its findings. If you explicitly want to skip, `claudex ack -C "<dir>"` acknowledges that change set. Reviews and acknowledgements save a fingerprint in `.claude/claudex-logs/.reviewed`; further changes trigger the reminder again. Fingerprints combine `git diff HEAD` and untracked file names, excluding `.claude/` and `.claudex-wt/` (untracked contents are not hashed). The hook skips clean trees, Git failures, disabled projects, and recursive Stop invocations.
+
+### Edit tracking
+
+The PostToolUse hook records Claude's direct file edits and shows them in `claudex status` (or `/claudex-status`). This is measurement only: it does not block edits or enforce delegation. Setup `on` confirms that the Stop and PostToolUse hooks are active in the project.
 
 ## Update
 
@@ -101,7 +114,7 @@ The plugin's Stop hook reminds Claude to review uncommitted changes in projects 
 /plugin update claudex
 ```
 
-then restart. Projects need no re-setup; the launcher resolves the newest installed version. If a release changes the CLAUDE.md rule, run `/claudex-auto` again to refresh it in place.
+then restart. The launcher resolves the newest installed version. If a release changed the CLAUDE.md rule, run `/claudex-auto` again to refresh it in place. See the [changelog](CHANGELOG.md) for release notes.
 
 ## Development
 
