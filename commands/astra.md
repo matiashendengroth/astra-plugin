@@ -5,7 +5,7 @@ argument-hint: <task>
 
 Run the full ASTRA pipeline on: **$ARGUMENTS**
 
-ASTRA wrapper: `${CLAUDE_PLUGIN_ROOT}/scripts/astra`. Call it directly with Bash (run_in_background: true, timeout 600000) — do not go through a relay subagent. Always pass `-C "<absolute project dir>"`. For long prompts write them to a scratchpad file and pipe: `cat brief.md | ${CLAUDE_PLUGIN_ROOT}/scripts/astra -C "<dir>"`.
+Analysis passes: call the wrapper directly (`~/.local/bin/astra -C "<abs dir>" "<question>"`, background Bash, timeout 600000; pipe long prompts from a file). The review goes through the `astra` subagent (Agent tool, subagent_type `astra:astra`, run_in_background: true) so it shows as a named agent.
 
 ## 1 · Claude — architect
 Read the relevant code. Write a brief (goal, constraints, files in play, open questions) to the scratchpad as `brief.md`. Decide the size: **small** (1 file, local change), **medium** (2–4 files, contained), **large** (new feature, refactor, cross-cutting, unclear bug).
@@ -20,7 +20,7 @@ Start the runs in ONE message as background Bash jobs, each fed the brief plus o
 Where do the passes agree, where do they conflict, what do you decide and why. Implement it yourself. Run tests/build.
 
 ## 4 · ASTRA — adversarial review (all sizes)
-`${CLAUDE_PLUGIN_ROOT}/scripts/astra review -C "<dir>" --uncommitted --json "Violations of this brief count as findings: <brief>"`
+Spawn one `astra` agent: "review: <absolute dir>. Violations of this brief count as findings: <brief>". Read the RESULT file it names.
 Review runs at its own effort (default medium) with a workspace-write sandbox so it can run the tests.
 
 ## 5 · Claude — final verify

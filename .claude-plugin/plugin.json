@@ -1,7 +1,7 @@
 {
   "name": "astra",
   "description": "Claude \u21c4 ASTRA (OpenAI Codex) pipeline: 3 parallel Codex passes, reconcile, adversarial review, verify",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": {
     "name": "Matias Henden",
     "email": "mh@smarteating.ai"
