@@ -80,54 +80,36 @@ def normalize_text(data):
     return data
 
 def fingerprint(root, deadline=None, snapshot=None):
-    started = time.monotonic()
+    """Deterministic content fingerprint of the working tree's in-scope changes.
+
+    Policy (fixed, independent of timing): tracked diff + every untracked in-scope file.
+    The first 300 untracked files (sorted) contribute a content hash when they are regular
+    files or symlinks of at most 1 MiB; anything else contributes path+size only. If the
+    hard deadline is hit the result is marked incomplete so it can never match a stored
+    review/ack fingerprint (the hook then stays conservative; `claudex ack` still works).
+    """
     diff, untracked = changes(root, deadline) if snapshot is None else snapshot
     digest = hashlib.sha256(normalize_text(diff) + b"\0")
-    metadata = []
-    tree = digest.copy()
-    for path in sorted(untracked):
+    incomplete = False
+    for index, path in enumerate(sorted(untracked)):
         if deadline is not None and time.monotonic() >= deadline:
-            raise subprocess.TimeoutExpired("fingerprint", 5)
-        info = os.lstat(os.path.join(root, os.fsdecode(path)))
-        stamp = (str(info.st_size) + ":" + str(info.st_mtime_ns)).encode("ascii")
-        metadata.append((path, info, stamp))
-        tree.update(path + b"\0" + stamp + b":" + str(info.st_mode).encode("ascii") + b"\0")
-    # Persist the chosen timed cutoff: scheduling must not change an unchanged tree's
-    # fingerprint. Cache keys include metadata for every path and the tracked diff.
-    cache = os.path.join(root, ".claude", "claudex-logs", ".fingerprint.json")
-    key = tree.hexdigest()
-    try:
-        with open(cache, encoding="utf-8") as f: saved = json.load(f)
-        if saved.get("tree") == key: return saved["fingerprint"]
-    except (OSError, ValueError, KeyError, AttributeError): pass
-    for index, (path, info, stamp) in enumerate(metadata):
-        if deadline is not None and time.monotonic() >= deadline:
-            raise subprocess.TimeoutExpired("fingerprint", 5)
+            incomplete = True; break
         filename = os.path.join(root, os.fsdecode(path))
+        try: info = os.lstat(filename)
+        except OSError: digest.update(path + b"\0missing\0"); continue
         digest.update(path + b"\0")
-        if (index >= 300 or time.monotonic() - started >= 1.5 or info.st_size > 1024 * 1024
-                or not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode))):
-            digest.update(b"stat:" + stamp + b"\0")
-            continue
-        if stat.S_ISLNK(info.st_mode):
-            data = os.fsencode(os.readlink(filename))
-        else:
-            with open(filename, "rb") as f: data = f.read(1024 * 1024 + 1)
-        if len(data) > 1024 * 1024 or time.monotonic() - started >= 1.5:
-            digest.update(b"stat:" + stamp + b"\0")
-        else:
-            digest.update(b"sha256:" + hashlib.sha256(normalize_text(data)).hexdigest().encode("ascii") + b"\0")
+        hashable = index < 300 and info.st_size <= 1024 * 1024 and (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode))
+        if not hashable:  # too large / special: size + mtime (deterministic for an unchanged tree)
+            digest.update(b"stat:" + str(info.st_size).encode("ascii") + b":" + str(info.st_mtime_ns).encode("ascii") + b"\0"); continue
+        try:
+            if stat.S_ISLNK(info.st_mode): data = os.fsencode(os.readlink(filename))
+            else:
+                with open(filename, "rb") as f: data = f.read(1024 * 1024 + 1)
+        except OSError: digest.update(b"unreadable\0"); continue
+        if len(data) > 1024 * 1024: digest.update(b"stat:" + str(info.st_size).encode("ascii") + b":" + str(info.st_mtime_ns).encode("ascii") + b"\0")
+        else: digest.update(b"sha256:" + hashlib.sha256(normalize_text(data)).hexdigest().encode("ascii") + b"\0")
     value = digest.hexdigest()
-    temporary = cache + "." + str(os.getpid())
-    try:
-        os.makedirs(os.path.dirname(cache), exist_ok=True)
-        with open(temporary, "w", encoding="utf-8") as f:
-            json.dump(dict(tree=key, fingerprint=value), f)
-        os.replace(temporary, cache)
-    except OSError:
-        try: os.unlink(temporary)
-        except OSError: pass
-    return value
+    return ("incomplete:" + value) if incomplete else value
 
 def acknowledge(root, value=None):
     value = fingerprint(root) if value is None else value
@@ -349,7 +331,8 @@ def merge(root):
         merged, conflicts = [], []
         for worktree in managed:
             branch = worktree["branch"]
-            result = git(root, "merge", "--no-ff", "--no-edit", branch, check=False)
+            tip = git(root, "rev-parse", branch).stdout.decode().strip()
+            result = git(root, "merge", "--no-ff", "--commit", "--no-edit", branch, check=False)
             if result.returncode:
                 files = paths(git(root, "diff", "--name-only", "--diff-filter=U", "-z").stdout)
                 # A non-conflict Git error must not be reported as a successful merge.
@@ -357,6 +340,14 @@ def merge(root):
                 if not files or abort.returncode:
                     raise subprocess.CalledProcessError(result.returncode, result.args, stderr=result.stderr)
                 conflicts.append((branch, files))
+                continue
+            # Only clean up once the builder's tip is really in HEAD and no merge is pending
+            # (a merge.mergeOptions/--no-commit config can return 0 without committing).
+            pending = os.path.exists(os.path.join(git(root, "rev-parse", "--git-dir").stdout.decode().strip(), "MERGE_HEAD"))
+            contained = git(root, "merge-base", "--is-ancestor", tip, "HEAD", check=False).returncode == 0
+            if pending or not contained:
+                conflicts.append((branch, {"(merge did not commit: tip %s not in HEAD)" % tip[:10]}))
+                if pending: git(root, "merge", "--abort", check=False)
                 continue
             merged.append(branch)
             git(root, "worktree", "remove", worktree["path"])

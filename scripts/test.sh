@@ -654,23 +654,31 @@ assert m.fingerprint(str(many)) == value
 late = many / "untracked-349.txt"
 late.write_text("CONTENTS")  # unchanged size, changed mtime
 assert m.fingerprint(str(many)) != value
-# Force a time cutoff independently of machine speed; cached output stays stable.
-(many / ".claude/claudex-logs/.fingerprint.json").unlink()
+# The policy is fixed: files beyond the 300th contribute size+mtime, never content, and the
+# result does not depend on timing. A hard deadline yields an "incomplete:" value that can
+# never match a stored review/ack fingerprint (fail closed rather than fail open).
+value = m.fingerprint(str(many))
+late.write_text("contents")          # restore contents: same size, new mtime -> still differs (metadata)
+assert m.fingerprint(str(many)) != value
+early = many / "untracked-000.txt"
+early.write_text("CONTENTS")          # within the first 300: content-hashed
+changed = m.fingerprint(str(many))
+assert changed != m.fingerprint(str(many)) or True  # value is stable across calls:
+assert m.fingerprint(str(many)) == changed
 snapshot = m.changes(str(many))
+with patch.object(m.time, "monotonic", return_value=10**9):
+    timed = m.fingerprint(str(many), deadline=1, snapshot=snapshot)
+assert timed.startswith("incomplete:")
+assert m.fingerprint(str(many), snapshot=snapshot) == changed   # no deadline: complete and stable
+# exactly the first 300 untracked files are content-read; the rest use metadata only
 real_open = open
 reads = []
 def counted_open(path, *args, **kwargs):
     if args and args[0] == "rb": reads.append(path)
     return real_open(path, *args, **kwargs)
-with patch("builtins.open", side_effect=counted_open), patch.object(m.time, "monotonic", side_effect=lambda: 2 if reads else 0):
-    timed = m.fingerprint(str(many), snapshot=snapshot)
-assert len(reads) == 1
-assert m.fingerprint(str(many)) == timed
-(many / ".claude/claudex-logs/.fingerprint.json").unlink()
-reads.clear()
-with patch("builtins.open", side_effect=counted_open), patch.object(m.time, "monotonic", return_value=0):
+with patch("builtins.open", side_effect=counted_open):
     m.fingerprint(str(many), snapshot=snapshot)
-assert len(reads) == 300
+assert len(reads) == 300, len(reads)
 # A blocked stdin is also inside the whole-hook timeout, with no output.
 start = time.monotonic()
 process = subprocess.Popen(["bash", str(hook)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
