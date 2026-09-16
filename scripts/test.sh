@@ -3,6 +3,7 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"; A="$HERE/claudex"
 PY="$(command -v python3 || command -v python)"
+export PYTHONDONTWRITEBYTECODE=1
 T="$(mktemp -d "$HERE/../.claudex-test.XXXXXX")"; trap 'rm -rf "$T"' EXIT
 T="$(cd "$T" && pwd -P)"
 NETWORK=1
@@ -19,6 +20,7 @@ printf 'def add(a,b):\n    return a+b\n' > calc.py
 mkdir -p "$T/stub-bin"
 cat > "$T/stub-bin/codex" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == --version ]]; then echo "codex-cli test-version"; exit 0; fi
 while [[ $# -gt 0 ]]; do
   if [[ "$1" == -o ]]; then
     if [[ "${STUB_FAIL:-0}" == 1 ]]; then :
@@ -276,11 +278,210 @@ assert all(k not in last_event() for k in measured)
 PY
 }
 check "measures CRLF transcripts, merges JSON, flags patches and records review events" 'coverage_checks'
+
+feature_checks() {
+  "$PY" - "$HERE" "$T" <<'PY'
+import importlib.util, json, os, pathlib, subprocess, sys, time
+from unittest.mock import patch
+here, temp = map(pathlib.Path, sys.argv[1:])
+base = temp / "features"
+base.mkdir()
+wrapper = here / "claudex"
+helper = here / "claudex-runs.py"
+spec = importlib.util.spec_from_file_location("runs_features", helper)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+def run(args, **kw):
+    result = subprocess.run([str(a) for a in args], text=True, capture_output=True, **kw)
+    assert result.returncode == 0, (args, result.returncode, result.stdout, result.stderr)
+    return result
+def git(root, *args): return run(["git", "-C", root, *args])
+def repo(name):
+    root = base / name
+    root.mkdir()
+    git(root, "init", "-q")
+    (root / "CLAUDE.md").write_text("<!-- claudex-auto:start -->\n")
+    (root / ".gitignore").write_text(".claude/\n.claudex-wt/\n")
+    (root / "tracked file.txt").write_text("original\n")
+    git(root, "add", "-A")
+    git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fixture")
+    return root
+def cli(root, *args): return run(["bash", wrapper, *args, "-C", root])
+def seed(root, events):
+    path = root / ".claude/claudex-logs/runs.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+# Preflight: isolated HOME, controlled CLI version and no real credentials.
+home = base / "home"
+home.mkdir()
+project = base / "setup"
+project.mkdir()
+env = dict(os.environ, HOME=str(home), CLAUDEX_WRAPPER=str(wrapper), CODEX_HOME=str(home / "custom-codex"))
+codex_home = pathlib.Path(env["CODEX_HOME"])
+codex_home.mkdir()
+def setup(action="on", **extra):
+    return run(["bash", here / "claudex-setup", project, action], env=dict(env, **extra)).stdout
+out = setup()
+assert "Preflight" in out and "codex-cli test-version" in out and "python: " in out, out
+assert "default (not set)" in out and "not signed in — run: codex" in out
+for model in ("test-mini", "test-nano"):
+    (codex_home / "config.toml").write_text('model = "' + model + '"\n[profiles.other]\nmodel = "ignored"\n')
+    (codex_home / "auth.json").write_text("{}")
+    out = setup()
+    assert "codex model: " + model in out and "reviews/builds will be weaker" in out, out
+    assert "auth.json present" in out
+(home / ".codex").mkdir()
+(home / ".codex/config.toml").write_text('model = "strong-model"\n')
+out = setup(CODEX_HOME="")
+assert "codex model: strong-model" in out and "weaker" not in out
+assert "Preflight" not in setup("off")
+# Simulate a missing CLI without depending on the host's PATH or installation.
+bash_env = base / "no-codex.sh"
+bash_env.write_text('command() { if [[ "$*" == "-v codex" ]]; then return 1; fi; builtin command "$@"; }\n')
+out = setup(BASH_ENV=str(bash_env))
+assert "codex CLI: NOT FOUND" in out and "npm i -g @openai/codex" in out
+assert "enabled" in out
+
+# Budget: latest event per run, terminal states, time window, live/dead and mode filtering.
+root = repo("budget")
+now = int(time.time())
+events = [dict(id=state, status=state, duration=900, ts=now, mode="exec")
+          for state in ("done", "failed", "timeout", "cancelled")]
+events += [dict(id="done", status="done", duration=960, ts=now, mode="exec"),
+           dict(id="old", status="done", duration=99999, ts=now-86401),
+           dict(id="future", status="done", duration=99999, ts=now+86400),
+           dict(id="stale", status="stale", duration=99999, ts=now),
+           dict(id="running", status="running", duration=99999, ts=now, mode="review", pid=0)]
+seed(root, events)
+out = cli(root, "budget")
+warning = "claudex: budget warning — 61 min used in last 24h (budget 60)"
+assert "61 min used in last 24h (budget 60)" in out.stdout and out.stderr.strip() == warning, out
+assert cli(root, "status").stderr.strip() == warning
+for mode in ([], ["review"], ["build"]):
+    result = run(["bash", wrapper, *mode, "-C", root, "test prompt"])
+    assert warning in result.stderr, result
+conf = root / ".claude/claudex.conf"
+conf.write_text("max_builders=1\nbudget_minutes=100\n")
+assert not cli(root, "budget").stderr
+assert "budget 100" in cli(root, "budget").stdout
+conf.write_text("max_builders=invalid\nbudget_minutes=-1\n")
+assert m.limits(root) == dict(max_builders=4, budget_minutes=60)
+seed(root, [dict(id="equal", status="done", duration=3600, ts=now)])
+assert not cli(root, "budget").stderr  # only warn when exceeded
+
+seed(root, [dict(id="alive", status="running", mode="build", pid=os.getpid(), ts=now),
+            dict(id="dead", status="running", mode="build", pid=0, ts=now),
+            dict(id="review", status="running", mode="review", pid=os.getpid(), ts=now),
+            dict(id="finished", status="done", mode="build", pid=os.getpid(), ts=now)])
+assert run([sys.executable, helper, "count-running", root, "build"]).stdout.strip() == "1"
+conf.write_text("max_builders=1\nbudget_minutes=60\n")
+blocked = subprocess.run(["bash", str(wrapper), "build", "-C", str(root), "test prompt"], text=True, capture_output=True)
+assert blocked.returncode == 3 and blocked.stderr.strip() == (
+    "claudex: build budget reached (1 running); wait, raise max_builders in .claude/claudex.conf, or run claudex cancel"), blocked
+linked = base / "budget-linked"
+git(root, "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+try:
+    assert "budget 60" in cli(linked, "budget").stdout
+    assert run([sys.executable, helper, "count-running", linked, "build"]).stdout.strip() == "1"
+    blocked = subprocess.run(["bash", str(wrapper), "build", "-C", str(linked), "test prompt"], text=True, capture_output=True)
+    assert blocked.returncode == 3, blocked
+finally: git(root, "worktree", "remove", "--force", str(linked))
+conf.write_text("max_builders=2\n")
+run(["bash", wrapper, "build", "-C", root, "test prompt"])
+# Defaults block four live builders, while reviews/exec remain allowed.
+conf.unlink()
+seed(root, [dict(id=str(i), status="running", mode="build", pid=os.getpid(), ts=now) for i in range(4)])
+blocked = subprocess.run(["bash", str(wrapper), "build", "-C", str(root), "test prompt"], text=True, capture_output=True)
+assert blocked.returncode == 3 and "(4 running)" in blocked.stderr
+run(["bash", wrapper, "review", "-C", root])
+# Existing Windows probe is also the count-running probe.
+with patch.object(m.os, "name", "nt"), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as probe:
+    assert m.count_running(root, "build") == 4
+    assert all(call.args[0][:2] == ["bash", "-c"] for call in probe.call_args_list)
+
+# Stop hook: silence in bypass cases, JSON only on block, shared fingerprint and review reuse.
+root = repo("hook project")
+hook = here / "claudex-hook-stop"
+def stop(active=False, directory=root):
+    start = time.monotonic()
+    result = run(["bash", hook], input=json.dumps(dict(cwd=str(directory), stop_hook_active=active)), env=env)
+    assert time.monotonic() - start < 2, "Stop hook exceeded two seconds"
+    assert result.stderr == "", result
+    return result.stdout
+assert stop() == ""  # clean tree
+tracked = root / "tracked file.txt"
+tracked.write_text("changed\n")
+assert stop(True) == ""
+(root / "CLAUDE.md").write_text("not enabled\n")
+assert stop() == ""
+(root / "CLAUDE.md").write_text("<!-- claudex-auto:start -->\n")
+blocked = json.loads(stop())
+assert blocked["decision"] == "block"
+assert str(home / ".local/bin/claudex") in blocked["reason"] and 'ack -C "' in blocked["reason"]
+assert str(root) in blocked["reason"]
+assert cli(root, "ack").stdout == ""
+assert stop() == ""
+reviewed = root / ".claude/claudex-logs/.reviewed"
+fingerprint = run([sys.executable, helper, "fingerprint", root]).stdout
+assert reviewed.read_text() == fingerprint
+# Metadata and managed worktree files do not invalidate an acknowledgement.
+(root / ".claude/extra").write_text("metadata")
+(root / ".claudex-wt").mkdir()
+(root / ".claudex-wt/untracked").write_text("ignored")
+assert stop() == ""
+# Untracked file names with spaces and tracked diffs do.
+(root / "untracked file.txt").write_text("new")
+assert json.loads(stop())["decision"] == "block"
+cli(root, "ack")
+tracked.write_text("changed again\n")
+assert json.loads(stop())["decision"] == "block"
+git(root, "add", "tracked file.txt")
+assert json.loads(stop())["decision"] == "block"  # staged diff is included
+mtime = int(time.time()) - 10
+os.utime(tracked, (mtime, mtime))
+seed(root, [dict(id="old-review", status="done", mode="review", ts=mtime-1),
+            dict(id="failed-review", status="failed", mode="review", ts=mtime+1),
+            dict(id="builder", status="done", mode="build", ts=mtime+1)])
+assert json.loads(stop())["decision"] == "block"
+seed(root, [dict(id="review", status="done", mode="review", ts=int(time.time())+1)])
+assert stop() == ""
+assert reviewed.read_text() == run([sys.executable, helper, "fingerprint", root]).stdout
+seed(root, [])
+assert stop() == ""  # successful review cached its fingerprint
+nonrepo = base / "not-git"
+nonrepo.mkdir()
+(nonrepo / "CLAUDE.md").write_text("<!-- claudex-auto:start -->\n")
+nonrepo_env = dict(env, GIT_CEILING_DIRECTORIES=str(base))
+result = run(["bash", hook], input=json.dumps(dict(cwd=str(nonrepo))), env=nonrepo_env)
+assert not result.stdout and not result.stderr
+assert not run(["bash", hook], input="invalid json").stdout
+with patch.object(m.os, "name", "nt"), patch.object(m.os.path, "realpath", side_effect=lambda p: p), patch.object(m.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "C:/project with spaces\n")) as convert:
+    assert m.project_path("/c/project with spaces") == "C:/project with spaces"
+    assert convert.call_args.args[0] == ["cygpath", "-m", "/c/project with spaces"]
+# A project enabled from a repository subdirectory uses relative tracked paths for mtimes.
+sub = root / "subproject"
+sub.mkdir()
+(sub / "CLAUDE.md").write_text("<!-- claudex-auto:start -->\n")
+(sub / "file.txt").write_text("original")
+git(root, "add", "subproject")
+git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "subproject fixture")
+(sub / "file.txt").write_text("modified")
+seed(root, [dict(id="old", status="done", mode="review", ts=int(time.time())-60)])
+assert json.loads(stop(directory=sub))["decision"] == "block"
+seed(root, [dict(id="new", status="done", mode="review", ts=int(time.time())+1)])
+assert stop(directory=sub) == ""
+manifest = json.loads((here.parent / "hooks/hooks.json").read_text())
+assert manifest == {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": '"${CLAUDE_PLUGIN_ROOT}/scripts/claudex-hook-stop"', "timeout": 20}]}]}}
+PY
+}
+echo "preflight, budget and Stop hook checks (no network)"
+check "preflight warnings, budget enforcement/accounting and review/ack hook" 'feature_checks'
 # Keep live smoke tests isolated from the offline fixtures.
 git -C "$T" worktree remove --force "$T/.claudex-wt/other"
 rmdir "$T/.claudex-wt"
 git -C "$T" worktree remove --force "$T/linked"
-rm -rf "$T/stub-bin" "$T/separate" "$T/separate-meta" "$T/nonrepo" "$T/safety" "$T/coverage" "$LONG_DIR"
+rm -rf "$T/stub-bin" "$T/separate" "$T/separate-meta" "$T/nonrepo" "$T/safety" "$T/coverage" "$T/features" "$LONG_DIR"
 export PATH="$REAL_PATH"
 if [[ $NETWORK -eq 0 ]]; then
   echo "skipping live Codex checks (--offline or codex unavailable)"

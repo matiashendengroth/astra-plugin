@@ -1,19 +1,115 @@
 #!/usr/bin/env python3
-"""Shared logic for claudex-status / claudex-cancel. Usage:
+"""Shared registry, budget and review-reminder logic. Usage:
    claudex-runs.py status <root>
    claudex-runs.py cancel <root> [--keep-worktrees]
+   claudex-runs.py count-running <root> <mode>
+   claudex-runs.py budget <root> [--warn-only]
+   claudex-runs.py fingerprint <root>
+   claudex-runs.py ack <root>
 """
-import json, os, sys, time, signal, subprocess
+import hashlib, json, os, sys, time, signal, subprocess
 
-def registry_root(directory):
+def registry_root(directory, deadline=None):
     directory = os.path.realpath(directory)
     try:
-        result = subprocess.run(["git", "-C", directory, "worktree", "list", "--porcelain"], capture_output=True, text=True)
+        result = subprocess.run(["git", "-C", directory, "worktree", "list", "--porcelain"], capture_output=True, text=True,
+                                timeout=remaining(deadline))
         if result.returncode == 0:
             for line in result.stdout.splitlines():
                 if line.startswith("worktree "): return os.path.realpath(line[9:])
     except OSError: pass
     return directory
+
+def remaining(deadline):
+    return max(0.001, deadline - time.monotonic()) if deadline is not None else None
+
+def project_path(directory, deadline=None):
+    # Hook JSON bypasses Git Bash's automatic argv path conversion.
+    if os.name == "nt" and directory.startswith("/"):
+        directory = subprocess.run(["cygpath", "-m", directory], capture_output=True,
+                                   text=True, check=True, timeout=remaining(deadline)).stdout.strip()
+    return os.path.realpath(directory)
+
+def limits(root):
+    values = {"max_builders": 4, "budget_minutes": 60}
+    try:
+        with open(os.path.join(root, ".claude", "claudex.conf"), encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.strip().partition("=")
+                if sep and key in values and value.isascii() and value.isdigit():
+                    values[key] = int(value)
+    except OSError: pass
+    return values
+
+def count_running(root, mode):
+    return sum(r["status"] == "running" and r["mode"] == mode and alive(r.get("pid"))
+               for r in load(root)[1].values())
+
+def budget(root, warn_only=False):
+    now = time.time()
+    seconds = sum(max(0, r["duration"]) for r in load(root)[1].values()
+                  if r["status"] in ("done", "failed", "timeout", "cancelled")
+                  and now - 86400 <= r["ts"] <= now)
+    limit = limits(root)["budget_minutes"]
+    used = format(seconds / 60, ".2f").rstrip("0").rstrip(".")
+    if not warn_only:
+        print(f"claudex: budget — {used} min used in last 24h (budget {limit})")
+    if seconds > limit * 60:
+        print(f"claudex: budget warning — {used} min used in last 24h (budget {limit})", file=sys.stderr)
+
+# Shared by ack and the Stop hook. NUL-delimited paths handle spaces/newlines and
+# --no-optional-locks prevents read-only hook commands from refreshing the index.
+CHANGE_PATHS = (".", ":(exclude).claude", ":(exclude).claudex-wt")
+
+def git_bytes(root, *args, deadline=None):
+    return subprocess.run(["git", "--no-optional-locks", "-C", root, *args],
+                          capture_output=True, check=True, timeout=remaining(deadline)).stdout
+
+def fingerprint(root, deadline=None):
+    diff = git_bytes(root, "diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", *CHANGE_PATHS, deadline=deadline)
+    untracked = git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *CHANGE_PATHS, deadline=deadline)
+    return hashlib.sha256(diff + b"\0" + untracked).hexdigest()
+
+def acknowledge(root, value=None):
+    value = fingerprint(root) if value is None else value
+    path = os.path.join(root, ".claude", "claudex-logs", ".reviewed")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f: f.write(value + "\n")
+
+def stop_hook(launcher):
+    deadline = time.monotonic() + 1.5
+    try:
+        payload = json.load(sys.stdin)
+        if payload.get("stop_hook_active") is True: return
+        root = project_path(payload["cwd"], deadline)
+        with open(os.path.join(root, "CLAUDE.md"), encoding="utf-8") as f:
+            if "claudex-auto:start" not in f.read(): return
+        if not git_bytes(root, "status", "--porcelain", deadline=deadline): return
+        value = fingerprint(root, deadline)
+        try:
+            with open(os.path.join(root, ".claude", "claudex-logs", ".reviewed"), encoding="utf-8") as f:
+                if value in f.read().splitlines(): return
+        except FileNotFoundError: pass
+        changed = git_bytes(root, "diff", "--relative", "--name-only", "-z", "HEAD", "--", *CHANGE_PATHS, deadline=deadline)
+        newest = 0
+        for path in changed.split(b"\0"):
+            if not path: continue
+            try: newest = max(newest, os.stat(os.path.join(root, os.fsdecode(path))).st_mtime)
+            except FileNotFoundError: pass  # deleted tracked files have no mtime
+        runs = load(registry_root(root, deadline))[1]
+        if any(r["status"] == "done" and r["mode"] == "review" and r["ts"] > newest for r in runs.values()):
+            acknowledge(root, value)
+            return
+        # Quote for Bash, including spaces and shell metacharacters in project paths.
+        def quote(path):
+            if os.name == "nt": path = path.replace("\\", "/")
+            return '"' + path.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
+        print(json.dumps({"decision": "block", "reason":
+            "CLAUDEX: there are uncommitted changes that have not been reviewed. "
+            "Run a review (claudex agent 'review: <dir>') and verify its findings, or, "
+            "if the user explicitly wants to skip, run: " + quote(launcher) + " ack -C " + quote(root)}))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+        return  # hooks must be silent and must not obstruct stopping on errors
 
 def load(root):
     p = os.path.join(root, ".claude", "claudex-logs", "runs.jsonl")
@@ -105,6 +201,7 @@ def worktrees(root):
     return managed
 
 def status(root):
+    budget(root, warn_only=True)
     p, runs = load(root)
     now = time.time()
     for r in runs.values():
@@ -180,7 +277,15 @@ def cancel(root, keep):
     if os.path.isdir(wtdir) and not os.listdir(wtdir): os.rmdir(wtdir)
 
 if __name__ == "__main__":
-    cmd, root = sys.argv[1], registry_root(sys.argv[2])
-    if cmd == "status": status(root)
-    elif cmd == "cancel": cancel(root, "--keep-worktrees" in sys.argv[3:])
-    else: sys.exit("unknown command")
+    cmd, directory = sys.argv[1:3]
+    if cmd == "stop-hook": stop_hook(directory)
+    elif cmd == "fingerprint": print(fingerprint(os.path.realpath(directory)))
+    elif cmd == "ack": acknowledge(os.path.realpath(directory))
+    else:
+        root = registry_root(directory)
+        if cmd == "status": status(root)
+        elif cmd == "cancel": cancel(root, "--keep-worktrees" in sys.argv[3:])
+        elif cmd == "count-running": print(count_running(root, sys.argv[3]))
+        elif cmd == "max-builders": print(limits(root)["max_builders"])
+        elif cmd == "budget": budget(root, "--warn-only" in sys.argv[3:])
+        else: sys.exit("unknown command")

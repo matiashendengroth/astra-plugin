@@ -43,6 +43,8 @@ Restart Claude Code so the plugin's commands load.
 
 One command, idempotent. It installs a stable launcher at `~/.local/bin/claudex`, adds an orchestration rule to the project's `CLAUDE.md`, pre-approves the launcher in `.claude/settings.local.json`, and gitignores the logs and build worktrees. `/claudex-auto off` removes the rule and permission.
 
+Setup `on` also prints a nonfatal **Preflight** block: Codex CLI version/install hint, configured model (with a warning for mini/nano models), sign-in file presence, and Python version. Config and auth come from `$CODEX_HOME`, or `~/.codex` when unset.
+
 From the next session on, Claude delegates on its own:
 
 | task size | what happens |
@@ -85,6 +87,12 @@ JSON reviews report `coverage`: files actually opened, commands run, whether tes
 Treat empty findings as low-confidence when no tests were detected, the model reports low confidence, or fewer than three exec calls were measured. Rerun at `-e high` or read the diff yourself, and state the coverage in your report.
 
 The run registry lives in the main worktree, so `status` and `cancel` also work from linked worktrees and subdirectories. Cancellation checks process identity and marks mismatches as stale. Cleanup only removes worktrees inside the main worktree's `.claudex-wt/` whose branches start with `claudex/`.
+
+### Budgets and review reminder
+
+Configure `max_builders` (default 4) and `budget_minutes` (default 60) in the main worktree's `.claude/claudex.conf`. A build exits with code 3 when that root already has the maximum number of live builders. Other run modes remain available. The minutes budget sums durations of done/failed/timeout/cancelled runs whose final timestamp is in the last 24 hours; exceeding it warns at every run start and in `claudex status`, without blocking. `claudex budget -C "<dir>"` prints usage and limit. Before large builds, Claude checks the budget and asks before starting more builders when over budget. Limits accept nonnegative integers; invalid values are ignored.
+
+The plugin's Stop hook reminds Claude to review uncommitted changes in projects enabled with `/claudex-auto`. A completed review newer than the changed tracked files satisfies the reminder. Otherwise it blocks stopping with instructions to run a review and verify its findings. If you explicitly want to skip, `claudex ack -C "<dir>"` acknowledges that change set. Reviews and acknowledgements save a fingerprint in `.claude/claudex-logs/.reviewed`; further changes trigger the reminder again. Fingerprints combine `git diff HEAD` and untracked file names, excluding `.claude/` and `.claudex-wt/` (untracked contents are not hashed). The hook skips clean trees, Git failures, disabled projects, and recursive Stop invocations.
 
 ## Update
 

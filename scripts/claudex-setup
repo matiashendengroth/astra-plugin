@@ -46,7 +46,6 @@ if [[ "$ACTION" == "off" ]]; then
 fi
 
 [[ "$ACTION" == "on" ]] || { echo "claudex-setup: action must be on|off" >&2; exit 2; }
-command -v codex >/dev/null 2>&1 || echo "warning: codex CLI not found. Install: npm i -g @openai/codex ; then run: codex" >&2
 
 # 1. stable launcher
 mkdir -p "$(dirname "$LAUNCHER")"; cp "$HERE/claudex-launcher" "$LAUNCHER"; chmod +x "$LAUNCHER"
@@ -54,6 +53,33 @@ CHECK="$("$LAUNCHER" -e turbo x 2>&1 || true)"   # wrapper exits 2 on purpose; w
 if [[ "$CHECK" != *"bad effort"* ]]; then
   echo "claudex-setup: launcher cannot find an installed claudex plugin; run /plugin install claudex@gryd first" >&2; exit 1
 fi
+
+# Informational only: missing tools/config/auth must not turn warnings into failures.
+echo "Preflight"
+if command -v codex >/dev/null 2>&1; then
+  VERSION="$(codex --version 2>/dev/null || true)"
+  echo "  codex CLI: ${VERSION:-version unavailable}"
+else
+  echo "  codex CLI: NOT FOUND — install: npm i -g @openai/codex"
+fi
+"$PY" - "${CODEX_HOME:-$HOME/.codex}" <<'PY' || true
+import os, re, sys
+home = sys.argv[1]
+model = None
+try:
+    with open(os.path.join(home, "config.toml"), encoding="utf-8") as f:
+        for line in f:
+            if line.lstrip().startswith("["): break  # only the top-level model
+            match = re.match(r'^\s*model\s*=\s*"([^"]*)"', line)
+            if match: model = match.group(1)
+except OSError: pass
+print("  codex model: " + (model or "default (not set)"))
+if model and any(name in model.lower() for name in ("mini", "nano")):
+    print("  warning: reviews/builds will be weaker; set a stronger model in config.toml")
+print("  codex auth: " + ("auth.json present" if os.path.isfile(os.path.join(home, "auth.json"))
+                         else "not signed in — run: codex"))
+print("  python: " + sys.version.split()[0])
+PY
 
 # 2. CLAUDE.md rule (refresh in place)
 REFRESH=0; [[ -f "$CLAUDE_MD" ]] && grep -q "$START" "$CLAUDE_MD" && REFRESH=1

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Claude Code Stop hook: keep stdout reserved for a blocking JSON decision.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PY="$(command -v python3 || command -v python || true)"
+[[ -n "$PY" ]] || exit 0
+"$PY" "$HERE/claudex-runs.py" stop-hook "$HOME/.local/bin/claudex" 2>/dev/null || true

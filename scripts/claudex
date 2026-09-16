@@ -5,6 +5,8 @@
 #   echo "prompt" | claudex [opts]          prompt from stdin
 #   claudex review [opts] [--uncommitted|--base BR|--commit SHA] ["focus"]
 #   claudex status [-C DIR]               running/recent runs and build worktrees
+#   claudex budget [-C DIR]               completed run minutes used/limit in the last 24h
+#   claudex ack [-C DIR]                  acknowledge the current changes without a review
 #   claudex cancel [-C DIR] [--keep-worktrees]   stop everything, clean up worktrees
 #   claudex build [opts] "spec"             implement a spec in DIR (workspace-write, effort default high,
 #                                         timeout default 1200). Prints what it changed.
@@ -97,7 +99,6 @@ if [[ "${1:-}" == coverage ]]; then
   echo "[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED patched=$PATCHED]"
   exit 0
 fi
-command -v codex >/dev/null 2>&1 || die "codex CLI not found. Install: npm i -g @openai/codex  then run: codex  (to log in)"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DIR="$PWD"; SANDBOX=""; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""; JSON=0; VERBOSE=0
@@ -105,7 +106,7 @@ TIMEOUT=""
 
 case "${1:-}" in
   review|build) MODE="$1"; shift ;;
-  status|cancel)  # delegate to the runs tool; accepts -C DIR and, for cancel, --keep-worktrees
+  status|cancel|budget|ack)  # local commands also work without Codex installed
     SUB="$1"; shift; SDIR="$PWD"; EXTRA=()
     while [[ $# -gt 0 ]]; do case "$1" in -C) SDIR="$2"; shift 2 ;; *) EXTRA+=("$1"); shift ;; esac; done
     exec "$PY" "$HERE/claudex-runs.py" "$SUB" "$SDIR" "${EXTRA[@]+"${EXTRA[@]}"}" ;;
@@ -153,13 +154,16 @@ if [[ -z "$EFFORT" ]]; then
 fi
 case "$EFFORT" in minimal|low|medium|high|xhigh) ;; *) die "bad effort '$EFFORT' (minimal|low|medium|high|xhigh)" ;; esac
 [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "bad timeout '$TIMEOUT'"
+command -v codex >/dev/null 2>&1 || die "codex CLI not found. Install: npm i -g @openai/codex  then run: codex  (to log in)"
 
 PROMPT="${*:-}"
 if [[ -z "$PROMPT" && "$MODE" != "review" && ! -t 0 ]]; then IFS= read -r -t 3 -d '' PROMPT || true; fi
 [[ "$MODE" != "review" && -z "$PROMPT" ]] && die "no prompt given"
 
 LOG_DIR="${CLAUDEX_LOG_DIR:-$DIR/.claude/claudex-logs}"; mkdir -p "$LOG_DIR"; LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
-ls -t "$LOG_DIR" 2>/dev/null | tail -n +121 | while read -r f; do rm -f "$LOG_DIR/$f"; done   # keep last ~40 runs (log+last+raw)
+ls -t "$LOG_DIR" 2>/dev/null | tail -n +121 | while read -r f; do
+  case "$f" in *.log|*.last.md|*.raw.md) rm -f "$LOG_DIR/$f" ;; esac
+done   # keep last ~40 runs, but retain the registry for 24h budget accounting
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"; OUT="$LOG_DIR/$STAMP.last.md"; LOG="$LOG_DIR/$STAMP.log"
 
 # Run registry: one JSON line per event in the MAIN repo (so builders in worktrees are visible
@@ -170,6 +174,15 @@ if WTS="$(git -C "$DIR" worktree list --porcelain 2>/dev/null)"; then
   [[ -n "$MAIN" ]] && ROOT="$MAIN"
 fi
 RUNS="$ROOT/.claude/claudex-logs/runs.jsonl"; mkdir -p "$(dirname "$RUNS")"
+"$PY" "$HERE/claudex-runs.py" budget "$ROOT" --warn-only
+if [[ "$MODE" == build ]]; then
+  MAX_BUILDERS="$("$PY" "$HERE/claudex-runs.py" max-builders "$ROOT")" || exit $?
+  RUNNING="$("$PY" "$HERE/claudex-runs.py" count-running "$ROOT" build)" || exit $?
+  if (( RUNNING >= MAX_BUILDERS )); then
+    echo "claudex: build budget reached ($RUNNING running); wait, raise max_builders in .claude/claudex.conf, or run claudex cancel" >&2
+    exit 3
+  fi
+fi
 TOKEN="$("$PY" -c 'import secrets; print(secrets.token_hex(16))')"
 TITLE="$(printf '%s' "${PROMPT:-review}" | head -1)"
 record() {  # record <status> [duration [tokens rc [exec_count tests_detected patched]]]
