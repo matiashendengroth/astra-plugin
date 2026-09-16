@@ -69,7 +69,9 @@ def command_executes(cmd):
                 if command_executes(script): return True
     runner = re.compile(r"^(?:python3?|node|deno|bun|ruby|php)(?:\s|$)|^(?:go\s+run|cargo\s+run|npx\s+(?:tsx|ts-node)|ts-node)(?:\s|$)")
     # package-manager verbs are not ad-hoc code execution (bun run build, bun install, node --version)
-    pm_verb = re.compile(r"^(?:bun|node|deno)\s+(?:run|install|add|remove|i|build|x|update|upgrade|link|pm|--version|-v)(?:\s|$)")
+    # `bun run build` / `deno task x` run package scripts; `bun run x.ts` / `deno run x.ts` execute files
+    pm_verb = re.compile(r"^(?:bun|node|deno)\s+(?:install|add|remove|i|x|update|upgrade|link|pm|task|--version|-v)(?:\s|$)"
+                         r"|^bun\s+run\s+(?![^\s;|&]*[./])[^\s;|&]+(?:\s|$)")
     for segment in re.split(r"\s*(?:;|&&|\|\||\||\n)\s*", cmd):
         segment = segment.strip().lstrip("(").strip()
         if pm_verb.match(segment): continue
