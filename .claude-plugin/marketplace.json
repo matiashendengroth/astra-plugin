@@ -1,16 +1,16 @@
 {
-  "name": "matias",
+  "name": "gryd",
   "owner": {
-    "name": "Matias Henden"
+    "name": "GRYD"
+  },
+  "metadata": {
+    "description": "GRYD plugins for Claude Code"
   },
   "plugins": [
     {
       "name": "astra",
       "source": "./",
-      "description": "Claude \u21c4 ASTRA (Codex) multi-agent pipeline"
+      "description": "Claude orchestrates, ASTRA (OpenAI Codex) builds and reviews. Parallel builders in git worktrees, adversarial JSON reviews, one-command setup."
     }
-  ],
-  "metadata": {
-    "description": "Matias Henden's Claude Code plugins"
-  }
+  ]
 }

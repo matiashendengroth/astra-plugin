@@ -44,7 +44,7 @@ command -v codex >/dev/null 2>&1 || echo "warning: codex CLI not found. Install:
 mkdir -p "$(dirname "$LAUNCHER")"; cp "$HERE/astra-launcher" "$LAUNCHER"; chmod +x "$LAUNCHER"
 CHECK="$("$LAUNCHER" -e turbo x 2>&1 || true)"   # wrapper exits 2 on purpose; we only need its text
 if [[ "$CHECK" != *"bad effort"* ]]; then
-  echo "astra-setup: launcher cannot find an installed astra plugin; run /plugin install astra@matias first" >&2; exit 1
+  echo "astra-setup: launcher cannot find an installed astra plugin; run /plugin install astra@gryd first" >&2; exit 1
 fi
 
 # 2. CLAUDE.md rule (refresh in place)

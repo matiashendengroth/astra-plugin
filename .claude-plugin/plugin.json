@@ -1,9 +1,18 @@
 {
   "name": "astra",
-  "description": "Claude \u21c4 ASTRA (OpenAI Codex) pipeline: 3 parallel Codex passes, reconcile, adversarial review, verify",
-  "version": "0.4.2",
+  "description": "Claude orchestrates, ASTRA (OpenAI Codex) builds and reviews. Claude classifies each task, writes specs, runs Codex builders in parallel git worktrees, merges, tests, gets an adversarial JSON review from Codex, and verifies every finding. One command to enable per project.",
+  "version": "0.5.0",
   "author": {
-    "name": "Matias Henden",
-    "email": "mh@smarteating.ai"
-  }
+    "name": "Matias Henden"
+  },
+  "homepage": "https://github.com/matiashendengroth/astra-plugin",
+  "repository": "https://github.com/matiashendengroth/astra-plugin",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "openai",
+    "multi-agent",
+    "orchestration",
+    "code-review"
+  ]
 }
