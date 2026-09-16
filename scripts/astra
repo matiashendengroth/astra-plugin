@@ -17,6 +17,8 @@
 #              mode-specific: $ASTRA_REVIEW_EFFORT / $ASTRA_BUILD_EFFORT, review_effort= / build_effort=
 #   -t SECS    timeout (default $ASTRA_TIMEOUT or 480; build: $ASTRA_BUILD_TIMEOUT or 1200).
 #   --json     review only: return findings as JSON matching scripts/review-schema.json
+#   -v         verbose: print the full Codex transcript (commands run, file edits, reasoning
+#              summaries) before the final answer, so it is visible in the caller's transcript
 #
 # Transcripts go to .claude/astra-logs/ in the project (last 40 kept).
 set -uo pipefail
@@ -25,7 +27,7 @@ die() { echo "astra: $*" >&2; exit 2; }
 command -v codex >/dev/null 2>&1 || die "codex CLI not found. Install: npm i -g @openai/codex  then run: codex  (to log in)"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-DIR="$PWD"; SANDBOX=""; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""; JSON=0
+DIR="$PWD"; SANDBOX=""; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""; JSON=0; VERBOSE=0
 TIMEOUT=""
 
 case "${1:-}" in review|build) MODE="$1"; shift ;; esac
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     -e) EFFORT="$2"; shift 2 ;;
     -t) TIMEOUT="$2"; shift 2 ;;
     --json) JSON=1; shift ;;
+    -v) VERBOSE=1; shift ;;
     --uncommitted) REVIEW_ARGS+=("$1"); shift ;;
     --base|--commit) REVIEW_ARGS+=("$1" "$2"); shift 2 ;;
     --) shift; break ;;
@@ -133,6 +136,12 @@ done
 wait "$PID"; RC=$?
 
 if [[ -s "$OUT" ]]; then
+  if [[ $VERBOSE -eq 1 ]]; then
+    echo "===== ASTRA TRANSCRIPT ($MODE, effort=$EFFORT) ====="
+    # print the transcript up to the token count; codex repeats the final answer after it
+    awk '/^tokens used$/{exit} {print}' "$LOG"
+    echo "===== ASTRA FINAL ANSWER ====="
+  fi
   cat "$OUT"; echo; echo "[astra log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
 else
   echo "astra: no final message produced (exit $RC). Log tail:" >&2; tail -40 "$LOG" >&2; exit 1

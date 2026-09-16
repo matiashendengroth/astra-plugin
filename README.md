@@ -30,6 +30,9 @@ Build timeout defaults to 1200 s (`ASTRA_BUILD_TIMEOUT`, `build_timeout=`); ever
 
 `/astra-effort <level>` sets `effort=`; `/astra-effort review|build <level>` sets the mode-specific key.
 
+## Seeing what ASTRA did
+Each ASTRA build or review runs as a named `astra` agent. Open it in the desktop tasks panel or `/tasks` in the terminal: its tool output holds ASTRA's full transcript (commands, patches, test runs, notes), because the relay calls the wrapper with `-v`. The orchestrator only receives the final answer plus the log path, so the main conversation stays small. Full logs also persist in `.claude/astra-logs/`.
+
 ## Wrapper
 `scripts/astra` — see the header for all options. Highlights: `-t SECS` timeout (default 480), `--json` structured review, `--ro`/`-w` sandbox override. Review defaults to workspace-write so Codex can run the test suite; set `review_sandbox=read-only` in `.claude/astra.conf` or `ASTRA_REVIEW_SANDBOX=read-only` to forbid that.
 
