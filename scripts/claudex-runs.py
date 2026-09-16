@@ -317,7 +317,8 @@ def merge(root):
     def display(files):
         return ", ".join(json.dumps(path, ensure_ascii=False) for path in sorted(files)) or "none"
     try:
-        if git(root, "status", "--porcelain", "--untracked-files=all").stdout:
+        # the tool's own folders never count as dirt
+        if git(root, "status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude).claudex-wt", ":(exclude).claude/claudex-logs").stdout:
             print("claudex: merge refused: current tree is dirty", file=sys.stderr)
             return 2
         managed = sorted(worktrees(root), key=lambda w: w["branch"])

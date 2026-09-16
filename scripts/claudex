@@ -44,7 +44,7 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
 RESULT = re.compile(r"^ (?:succeeded|exited \d+) in .*:$")
 CMD_END = re.compile(r" in (?:/|[A-Za-z]:[\\/]|~)\S.*$")   # "... in /abs/dir" ends the command
 HEADERS = ("exec", "apply patch", "thinking", "codex", "user", "tokens used", "file update")
-RUNNER = re.compile(r"^(?:sudo\s+)?(?:pytest|py\.test|python3?\s+-m\s+(?:pytest|unittest)|npm\s+(?:run\s+)?test|yarn\s+test|pnpm\s+test|npx\s+(?:jest|vitest)|jest|vitest|bun\s+test|node\s+--test|go\s+test|cargo\s+test|mvn\s+test|\.?/?gradlew?\s+test|dotnet\s+test|(?:bundle\s+exec\s+)?rspec|phpunit|make\s+test)(?:\s|$)")
+RUNNER = re.compile(r"^(?:sudo\s+)?(?:pytest|py\.test|python3?\s+-m\s+(?:pytest|unittest)|npm\s+(?:run\s+)?test(?::\S+)?|yarn\s+(?:run\s+)?test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|bun\s+(?:run\s+)?test(?::\S+)?|turbo\s+run\s+test(?::\S+)?|npx\s+(?:jest|vitest)|jest|vitest|node\s+--test|go\s+test|cargo\s+test|mvn\s+test|\.?/?gradlew?\s+test|dotnet\s+test|(?:bundle\s+exec\s+)?rspec|phpunit|make\s+test)(?:\s|$)")
 def command_runs_tests(cmd):
     cmd = re.sub(r"^\S*(?:sh|bash|zsh|cmd(?:\.exe)?|powershell|pwsh)\s+(?:-\w+\s+)*", "", cmd)  # strip shell prefix
     cmd = cmd.strip().strip("'\"")
@@ -68,8 +68,11 @@ def command_executes(cmd):
                     return True
                 if command_executes(script): return True
     runner = re.compile(r"^(?:python3?|node|deno|bun|ruby|php)(?:\s|$)|^(?:go\s+run|cargo\s+run|npx\s+(?:tsx|ts-node)|ts-node)(?:\s|$)")
+    # package-manager verbs are not ad-hoc code execution (bun run build, bun install, node --version)
+    pm_verb = re.compile(r"^(?:bun|node|deno)\s+(?:run|install|add|remove|i|build|x|update|upgrade|link|pm|--version|-v)(?:\s|$)")
     for segment in re.split(r"\s*(?:;|&&|\|\||\||\n)\s*", cmd):
         segment = segment.strip().lstrip("(").strip()
+        if pm_verb.match(segment): continue
         if runner.match(segment): return True
         if segment != cmd.strip() and re.match(r"^(?:\S*/)?(?:bash|sh)\s", segment):
             if command_executes(segment): return True
