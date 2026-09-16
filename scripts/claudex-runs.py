@@ -8,7 +8,7 @@
    claudex-runs.py fingerprint <dir>
    claudex-runs.py ack <root>
 """
-import hashlib, json, math, os, sys, time, signal, stat, subprocess
+import hashlib, json, math, os, re, sys, time, signal, stat, subprocess
 
 def registry_root(directory, deadline=None):
     directory = os.path.realpath(directory)
@@ -445,6 +445,148 @@ def cancel(root, keep):
     wtdir = os.path.join(root, ".claudex-wt")
     if os.path.isdir(wtdir) and not os.listdir(wtdir): os.rmdir(wtdir)
 
+# ---------------------------------------------------------------------------
+# Context packets: everything a review needs, assembled by git, so Codex does not
+# spend its first N tool calls rediscovering the repo on every run.
+PACKET_FILE_LIMIT = 48 * 1024      # per file; larger files get head+tail
+PACKET_TOTAL_LIMIT = 220 * 1024    # all file bodies together
+CONVENTION_FILES = ("AGENTS.md", "CLAUDE.md", ".codex/AGENTS.md")
+# review scope excludes only generated dirs (NOT all of .claude — hooks/settings changes are real changes)
+PACKET_PATHS = (".", ":(exclude).claude/claudex-logs", ":(exclude).claudex-wt")
+
+class PacketError(Exception): pass
+
+def _git_out(root, *args):
+    """git stdout as bytes; raises PacketError with git's message on failure."""
+    r = subprocess.run(["git", "--no-optional-locks", "-C", root, *args], capture_output=True)
+    if r.returncode: raise PacketError((r.stderr or b"git failed").decode("utf-8", "replace").strip())
+    return r.stdout
+
+def _limit_body(data, total, limit=PACKET_FILE_LIMIT):
+    """head+tail of `data` (already the full content or a real tail-inclusive read)."""
+    if b"\0" in data[:8192]: return b"<binary file omitted>"
+    data = normalize_text(data)
+    if total <= limit and len(data) <= limit: return data
+    head, tail = data[: limit * 2 // 3], data[-(limit // 3):]
+    return head + b"\n\n[... %d bytes omitted ...]\n\n" % (max(total, len(data)) - len(head) - len(tail)) + tail
+
+def _read_limited(path, limit=PACKET_FILE_LIMIT):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size <= limit * 4: return _limit_body(f.read(), size, limit)
+            head = f.read(limit)                  # real head and real tail of a large file
+            f.seek(-limit, os.SEEK_END); tail = f.read(limit)
+        return _limit_body(head + b"\n" + tail, size, limit)
+    except OSError: return None
+
+def _conventions(root):
+    parts = []
+    for name in CONVENTION_FILES:
+        path = os.path.join(root, name)
+        if not os.path.isfile(path): continue
+        text = _read_limited(path, 12 * 1024) or b""
+        text = re.sub(rb"<!-- claudex-auto:start -->.*?<!-- claudex-auto:end -->\n?", b"", text, flags=re.S)
+        if text.strip(): parts.append(b"### " + name.encode() + b"\n" + text.strip() + b"\n")
+    return b"\n".join(parts) if parts else b"(no AGENTS.md / CLAUDE.md in this project)\n"
+
+def _test_command(root):
+    pkg = os.path.join(root, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            data = json.load(open(pkg, encoding="utf-8"))
+            scripts = data.get("scripts") if isinstance(data, dict) else None
+            if isinstance(scripts, dict):
+                runner = "bun" if any(os.path.isfile(os.path.join(root, f)) for f in ("bun.lock", "bun.lockb")) else \
+                         "pnpm" if os.path.isfile(os.path.join(root, "pnpm-lock.yaml")) else \
+                         "yarn" if os.path.isfile(os.path.join(root, "yarn.lock")) else "npm"
+                names = [n for n in scripts if isinstance(n, str) and (n == "test" or n.startswith("test:"))]
+                if names: return "; ".join(f"{runner} run {n}" for n in names[:4])
+        except (ValueError, OSError, AttributeError, TypeError): pass
+    for probe, cmd in (("pytest.ini", "pytest"), ("pyproject.toml", "pytest"), ("setup.cfg", "pytest"),
+                       ("Cargo.toml", "cargo test"), ("go.mod", "go test ./..."), ("Makefile", "make test")):
+        if os.path.isfile(os.path.join(root, probe)): return cmd
+    return "(no test command detected)"
+
+def _name_status_z(raw):
+    """Parse `--name-status -z` output into [(status_letter, path_bytes)], handling renames/copies."""
+    fields = [f for f in raw.split(b"\0")]
+    out, i = [], 0
+    while i < len(fields):
+        st = fields[i]
+        if not st: i += 1; continue
+        if st[:1] in (b"R", b"C") and i + 2 < len(fields): out.append((st[:1].decode(), fields[i + 2])); i += 3
+        elif i + 1 < len(fields): out.append((st[:1].decode(), fields[i + 1])); i += 2
+        else: break
+    return out
+
+def scope_diff(root, scope):
+    """(diff_bytes, [(status, path_bytes)]) for the scope; paths are relative to `root` (a subdir works)."""
+    kind = scope[0]
+    if kind == "uncommitted":
+        diff = _git_out(root, "diff", "HEAD", "--relative", "--no-ext-diff", "--", *PACKET_PATHS)
+        files = _name_status_z(_git_out(root, "diff", "HEAD", "--relative", "--name-status", "-z", "--", *PACKET_PATHS))
+        untracked = [p for p in _git_out(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *PACKET_PATHS).split(b"\0") if p]
+        for p in untracked:
+            files.append(("A", p))
+            body = _read_limited(os.path.join(root, os.fsdecode(p)))
+            if body is not None and body != b"<binary file omitted>":
+                diff += b"\n--- /dev/null\n+++ b/" + p + b"\n" + b"".join(b"+" + line + b"\n" for line in body.split(b"\n"))
+        return diff, files
+    if kind == "base":
+        rng = f"{scope[1]}...HEAD"
+        return (_git_out(root, "diff", rng, "--relative", "--no-ext-diff", "--", *PACKET_PATHS),
+                _name_status_z(_git_out(root, "diff", rng, "--relative", "--name-status", "-z", "--", *PACKET_PATHS)))
+    if kind == "commit":
+        return (_git_out(root, "show", scope[1], "--format=%H %s%n%b", "--relative", "--no-ext-diff", "--", *PACKET_PATHS),
+                _name_status_z(_git_out(root, "show", scope[1], "--format=", "--relative", "--name-status", "-z", "--", *PACKET_PATHS)))
+    raise PacketError("unknown scope")
+
+def _fence(body):
+    longest = max((len(m) for m in re.findall(rb"`{3,}", body)), default=0)
+    return b"`" * max(3, longest + 1)
+
+def _body_at(root, scope, path):
+    """Post-change contents: working tree for uncommitted, HEAD for --base, the commit for --commit."""
+    if scope[0] == "uncommitted": return _read_limited(os.path.join(root, os.fsdecode(path)))
+    rev = "HEAD" if scope[0] == "base" else scope[1]
+    prefix = _git_out(root, "rev-parse", "--show-prefix").decode().strip()
+    try: data = _git_out(root, "show", f"{rev}:{prefix}{os.fsdecode(path)}")
+    except PacketError: return None
+    return _limit_body(data, len(data))
+
+def packet(root, scope):
+    diff, files = scope_diff(root, scope)
+    out = [b"## Project conventions (already loaded; do not search for AGENTS.md)\n", _conventions(root),
+           b"\n## Test command\n", _test_command(root).encode() + b"\n",
+           b"\n## Changed files (%d)\n" % len(files)]
+    out += [b"- " + st.encode() + b" " + path + b"\n" for st, path in files]
+    f = _fence(diff)
+    out += [b"\n## Diff\n", f + b"diff\n", diff.rstrip(b"\n"), b"\n" + f + b"\n"]
+    budget = PACKET_TOTAL_LIMIT
+    out.append(b"\n## Full contents of changed files (post-change)\n")
+    for st, path in files:
+        if st == "D": continue
+        body = _body_at(root, scope, path)
+        if body is None: continue
+        if budget - len(body) < 0:
+            out.append(b"\n### " + path + b"\n(omitted: packet size limit reached; read it yourself if needed)\n"); continue
+        budget -= len(body)
+        f = _fence(body)
+        out += [b"\n### " + path + b"\n", f + b"\n", body.rstrip(b"\n"), b"\n" + f + b"\n"]
+    return b"".join(out)
+
+def last_session(root, directory, mode):
+    """Newest done record of `mode` for this directory that has a codex session id."""
+    _, runs = load(root)
+    best = None
+    for r in runs.values():
+        if r.get("status") != "done" or r.get("mode") != mode or not r.get("session"): continue
+        if os.path.realpath(r.get("dir", "")) != os.path.realpath(directory): continue
+        if best is None or r["ts"] > best["ts"]: best = r
+    return best
+
+
 if __name__ == "__main__":
     cmd, directory = sys.argv[1:3]
     if cmd == "guard-stop-hook": guarded_hook("stop-hook", directory)
@@ -453,6 +595,21 @@ if __name__ == "__main__":
     elif cmd == "stop-hook": stop_hook(directory)
     elif cmd == "fingerprint": print(fingerprint(os.path.realpath(directory)))
     elif cmd == "ack": acknowledge(os.path.realpath(directory))
+    elif cmd in ("packet", "scope-diff"):
+        args = sys.argv[3:]
+        scope = ("uncommitted",)
+        if args and args[0] == "--base": scope = ("base", args[1])
+        elif args and args[0] == "--commit": scope = ("commit", args[1])
+        try:
+            if cmd == "packet": sys.stdout.buffer.write(packet(os.path.realpath(directory), scope))
+            else:
+                diff, files = scope_diff(os.path.realpath(directory), scope)
+                sys.stdout.buffer.write(diff)
+        except PacketError as e:
+            sys.stderr.write("claudex: cannot build context for scope %s: %s\n" % (" ".join(scope), e)); sys.exit(2)
+    elif cmd == "last-session":
+        r = last_session(registry_root(directory), directory, sys.argv[3])
+        print(json.dumps({k: r.get(k) for k in ("id", "session", "log", "ts", "fingerprint")}) if r else "")
     else:
         root = registry_root(directory)
         if cmd == "merge": sys.exit(merge(root))

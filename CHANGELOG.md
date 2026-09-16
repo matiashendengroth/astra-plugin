@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.5.11
+- Context engineering: reviews get a pre-assembled packet (conventions, test command, changed files, diff, file contents) with a stable prompt prefix and a no-discovery rule; `--resume` continues the previous review/build session for cheap follow-ups; session ids and a `discovery` metric in the registry; test suite offline by default (`--live` for Codex checks).
+
 ## 0.5.10
 - Executed coverage signal; uniform review path with tokens; JSON build reports.
 - Hook deadline, direct-edit tracking, and merge subcommand.

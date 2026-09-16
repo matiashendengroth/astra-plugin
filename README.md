@@ -73,6 +73,12 @@ Single-chunk builds remain uncommitted. For parallel builds, the merge command c
 
 See [Writing specs for CLAUDEX builders](docs/SPECS.md) for ownership, shared interfaces, acceptance criteria, and examples. If merge exits 4, the orchestrator resolves the listed conflicts in the remaining worktree(s) and re-runs merge.
 
+## Context engineering (what keeps Codex usage down)
+- **Packets, not exploration.** A review does not start by exploring the repo. The wrapper assembles a context packet with git first — project conventions, the test command, the changed-file list, the full diff, and the post-change contents of every changed file (size-capped) — and tells Codex not to run discovery commands or re-read what it already has. The static instructions come first in the prompt so provider prompt caching hits across calls.
+- **Resume, don't restart.** `--resume` continues the last review or build session for the directory. A re-review after fixes sends only the current diff plus the previous findings and asks for fixed / still open / new; a build follow-up sends the failure to the builder that wrote the code. Measured on a small repo: re-review 2.7k tokens vs 21k cold; build follow-up 4.4k vs 20k.
+- **Discovery is measured.** Coverage reports `discovery`: how many of Codex's commands were exploration (ls, find, git status/log, hunting for AGENTS.md). If it is not near zero, the packet is not doing its job.
+- The offline test suite is the default; `scripts/test.sh --live` runs the Codex-backed checks.
+
 ## Reasoning effort and timeouts
 
 | mode | default effort | default timeout | overrides |

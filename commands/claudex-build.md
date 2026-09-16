@@ -23,7 +23,7 @@ Require a clean tree (`git status --porcelain` empty; otherwise stop and tell th
 One chunk: build in the project dir instead, no worktree. Wait for all builders. After each build, read the JSON build report in its RESULT file. Treat `needs_attention` and `left_undone` as findings to check. If `measured.tests_detected` is false and `tests_run` is true, note the discrepancy.
 
 ## 4 · Merge
-For worktree builds, run `"${CLAUDE_PLUGIN_ROOT}/scripts/claudex" merge -C "<root>"`, where `<root>` is the absolute project root. It commits the build worktrees and merges the `claudex/` branches. On exit 4, resolve the listed conflicts yourself in the remaining worktree(s), then re-run the same merge command. One chunk built in the project dir needs no merge. Run the test command. Fix build/test failures yourself if small; otherwise send the failure back to one CLAUDEX build call with the error and the affected files.
+For worktree builds, run `"${CLAUDE_PLUGIN_ROOT}/scripts/claudex" merge -C "<root>"`, where `<root>` is the absolute project root. It commits the build worktrees and merges the `claudex/` branches. On exit 4, resolve the listed conflicts yourself in the remaining worktree(s), then re-run the same merge command. One chunk built in the project dir needs no merge. Run the test command. Fix build/test failures yourself if small; otherwise send the failure back to the same builder as a follow-up (the `claudex` agent with "follow-up / resume" and the error) — it reuses the session instead of starting cold.
 
 ## 5 · CLAUDEX review
 Spawn one `claudex` agent: "review: <absolute project dir>. Acceptance criteria: <from brief>". Read the RESULT file it names for the JSON findings.

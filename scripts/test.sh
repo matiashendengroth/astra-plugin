@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Smoke test against a throwaway repo. Use --offline to skip logged-in Codex checks.
+# Smoke test against a throwaway repo. Offline by default; pass --live to also run the
+# logged-in Codex checks (each is a real Codex session — ~14 calls).
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"; A="$HERE/claudex"
 PY="$(command -v python3 || command -v python)"
 export PYTHONDONTWRITEBYTECODE=1
 T="$(mktemp -d "$HERE/../.claudex-test.XXXXXX")"; trap 'rm -rf "$T"' EXIT
 T="$(cd "$T" && pwd -P)"
-NETWORK=1
-if [[ "${1:-}" == --offline ]] || ! command -v codex >/dev/null 2>&1; then NETWORK=0; fi
+NETWORK=0
+if [[ "${1:-}" == --live ]] && command -v codex >/dev/null 2>&1; then NETWORK=1; fi
 REAL_PATH="$PATH"
 pass=0; fail=0
 ok()   { echo "  ✔ $1"; pass=$((pass+1)); }
@@ -218,7 +219,7 @@ codex
 """
 with open(log, "wb") as f:
     f.write(transcript.replace("\n", "\r\n").encode())
-line = "[claudex coverage: exec=4 tests=yes executed=no patched=1]"
+line = "[claudex coverage: exec=4 tests=yes executed=no patched=1 discovery=1]"
 assert subprocess.check_output([wrapper, "coverage", log], text=True).strip() == line
 negative = os.path.join(directory, "negative.log")
 with open(negative, "w") as f:
@@ -228,14 +229,14 @@ with open(negative, "w") as f:
             "exec\n/bin/bash -lc 'cat pytest.ini' in /repo\n succeeded in 1ms:\n[pytest]\n"
             "exec\n/bin/bash -lc 'echo \"npm test\"; rg jest package.json' in /repo\n succeeded in 1ms:\nnpm test\n"
             "apply patch\n*** Update File: fake.py\n*** End Patch\n")
-assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=2 tests=no executed=no patched=0]"
+assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=2 tests=no executed=no patched=0 discovery=0]"
 with open(negative, "w") as f:
     f.write("exec\n/bin/bash -lc 'cd /repo\npython3 -m pytest -q' in /repo\n succeeded in 2ms:\nok\n"
             "apply patch\npatch: completed\n/repo/a.py\n/repo/b.py\ndiff --git a/a.py b/a.py\ndiff --git a/zzz.py b/zzz.py\n\ncodex\nexec\n")
-assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=1 tests=yes executed=yes patched=2]"
+assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=1 tests=yes executed=yes patched=2 discovery=0]"
 with open(negative, "w") as f:
     f.write("")
-assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=0 tests=no executed=no patched=0]"
+assert subprocess.check_output([wrapper, "coverage", negative], text=True).strip() == "[claudex coverage: exec=0 tests=no executed=no patched=0 discovery=0]"
 # Ad hoc execution is distinct from merely reading code or mentioning a runner.
 for command, expected in [
     ("python3 <<'PY'\nprint(1)\nPY", True),
@@ -287,11 +288,15 @@ with open(last_event()["log"].replace(".log", ".last.md")) as f:
     assert json.load(f) == dict(claimed, measured=measured)
 with open(last_event()["log"].replace(".log", ".raw.md")) as f:
     assert json.load(f) == claimed
-args_file = os.path.join(directory, "args.txt")
-result = run("review", STUB_ARGS=args_file)
+args_file = os.path.join(directory, "args.txt"); input_file = os.path.join(directory, "stdin.txt")
+result = run("review", STUB_ARGS=args_file, STUB_INPUT=input_file)
 with open(args_file) as f: arguments = f.read().splitlines()
 assert arguments[0] == "exec" and "review" not in arguments and "--output-schema" not in arguments
-assert any("adversarial code review" in arg and "uncommitted changes" in arg for arg in arguments)
+with open(input_file) as f: prompt = f.read()
+# prompt goes over stdin: static prefix first, then the context packet, then the focus
+assert prompt.startswith("You are doing an adversarial code review.") and "uncommitted changes" in prompt
+assert "# CONTEXT PACKET" in prompt and "## Changed files" in prompt and "## Diff" in prompt and prompt.index("# CONTEXT PACKET") < prompt.index("# FOCUS")
+assert "do not search for AGENTS.md" in prompt
 assert last_event()["tokens"] == 1234
 assert result.returncode == 0 and line in result.stdout
 check_event("done")
@@ -783,7 +788,7 @@ git -C "$T" worktree remove --force "$T/linked"
 rm -rf "$T/stub-bin" "$T/separate" "$T/separate-meta" "$T/nonrepo" "$T/safety" "$T/coverage" "$T/features" "$LONG_DIR"
 export PATH="$REAL_PATH"
 if [[ $NETWORK -eq 0 ]]; then
-  echo "skipping live Codex checks (--offline or codex unavailable)"
+  echo "skipping live Codex checks (pass --live to run them)"
   echo "passed=$pass failed=$fail"; [[ $fail -eq 0 ]]; exit $?
 fi
 rm -f "$T/.claude/claudex-logs/runs.jsonl"

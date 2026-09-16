@@ -22,6 +22,10 @@
 #              mode-specific: $CLAUDEX_REVIEW_EFFORT / $CLAUDEX_BUILD_EFFORT, review_effort= / build_effort=
 #   -t SECS    timeout (default $CLAUDEX_TIMEOUT or 480; build: $CLAUDEX_BUILD_TIMEOUT or 1200).
 #   --json     review only: return findings as JSON matching scripts/review-schema.json
+#   --resume   continue the last done review/build session for DIR instead of starting cold:
+#              review: sends only the current diff + your previous findings ("re-check");
+#              build: sends the prompt as a follow-up (e.g. a test failure) to the same builder.
+#   --no-packet review: skip the pre-assembled context packet (diff + changed files + conventions)
 #   -v         verbose: print the full Codex transcript (commands run, file edits, reasoning
 #              summaries) before the final answer, so it is visible in the caller's transcript
 #
@@ -79,7 +83,13 @@ def command_executes(cmd):
         if segment != cmd.strip() and re.match(r"^(?:\S*/)?(?:bash|sh)\s", segment):
             if command_executes(segment): return True
     return False
-exec_count = 0; tests_detected = False; executed = False; paths = set()
+DISCOVERY = re.compile(r"^(?:ls|pwd|find|tree|rg\s+--files|git\s+(?:status|log|ls-files|branch|diff\s+--stat)|cat\s+\S*(?:AGENTS|CLAUDE)\.md|wc)(?:\s|$)")
+def command_discovers(cmd):
+    cmd = re.sub(r"^\S*(?:sh|bash|zsh|cmd(?:\.exe)?|powershell|pwsh)\s+(?:-\w+\s+)*", "", cmd).strip().strip("'\"")
+    segs = [x.strip().lstrip("(").strip() for x in re.split(r"\s*(?:;|&&|\|\||\||\n)\s*", cmd)]
+    segs = [x for x in segs if x and not re.match(r"^(?:cd|pushd|popd)(?:\s|$)", x)]   # navigation is not discovery
+    return bool(segs) and all(DISCOVERY.match(x) for x in segs)
+exec_count = 0; tests_detected = False; executed = False; discovery = 0; paths = set()
 i = 0
 while i < len(lines):
     line = lines[i]
@@ -96,6 +106,7 @@ while i < len(lines):
             text = "\n".join(cmd); text = CMD_END.sub("", text, count=1) if len(cmd) == 1 else re.sub(CMD_END, "", text)
             tests_detected |= command_runs_tests(text)
             executed |= command_executes(text)
+            discovery += 1 if command_discovers(text) else 0
             i = j + 1; continue
         i += 1; continue
     if line == "apply patch":
@@ -116,7 +127,7 @@ while i < len(lines):
             i = j + 1; continue
         i += 1; continue
     i += 1
-print(exec_count, "yes" if tests_detected else "no", "yes" if executed else "no", len(paths))
+print(exec_count, "yes" if tests_detected else "no", "yes" if executed else "no", len(paths), discovery)
 PY
 }
 
@@ -124,13 +135,13 @@ PY
 if [[ "${1:-}" == coverage ]]; then
   [[ $# -eq 2 && -f "$2" ]] || die "usage: claudex coverage <logfile>"
   VALUES="$(coverage "$2")" || exit $?
-  read -r EXEC_COUNT TESTS_DETECTED EXECUTED PATCHED <<<"$VALUES"
-  echo "[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED executed=$EXECUTED patched=$PATCHED]"
+  read -r EXEC_COUNT TESTS_DETECTED EXECUTED PATCHED DISCOVERY <<<"$VALUES"; export CLAUDEX_DISCOVERY="$DISCOVERY"
+  echo "[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED executed=$EXECUTED patched=$PATCHED discovery=$DISCOVERY]"
   exit 0
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-DIR="$PWD"; SANDBOX=""; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""; JSON=0; VERBOSE=0
+DIR="$PWD"; SANDBOX=""; MODEL_ARGS=(); MODE="exec"; REVIEW_ARGS=(); EFFORT=""; JSON=0; VERBOSE=0; RESUME=0; PACKET=1
 TIMEOUT=""
 
 case "${1:-}" in
@@ -150,6 +161,8 @@ while [[ $# -gt 0 ]]; do
     -t) TIMEOUT="$2"; shift 2 ;;
     --json) JSON=1; shift ;;
     -v) VERBOSE=1; shift ;;
+    --resume) RESUME=1; shift ;;
+    --no-packet) PACKET=0; shift ;;
     --uncommitted) REVIEW_ARGS+=("$1"); shift ;;
     --base|--commit) REVIEW_ARGS+=("$1" "$2"); shift 2 ;;
     --) shift; break ;;
@@ -254,6 +267,10 @@ for key, value in (("duration", duration), ("tokens", tokens), ("rc", rc)):
         except ValueError: event[key] = 0
 if exec_count:
     event.update(exec_count=int(exec_count), tests_detected=tests_detected == "yes", executed=executed == "yes", patched=int(patched))
+    if os.environ.get("CLAUDEX_DISCOVERY", "").isdigit(): event["discovery"] = int(os.environ["CLAUDEX_DISCOVERY"])
+import os as _os
+if _os.environ.get("CLAUDEX_SESSION"): event["session"] = _os.environ["CLAUDEX_SESSION"]
+if _os.environ.get("CLAUDEX_RESUMED"): event["resumed"] = _os.environ["CLAUDEX_RESUMED"]
 print(json.dumps(event, separators=(",", ":")))
 PY
 }
@@ -273,21 +290,72 @@ if [[ "$MODE" == "review" ]]; then
   esac
   SCOPE="$SCOPE. Ignore .claude/claudex-logs/"
   [[ "$SANDBOX" != "read-only" ]] && SCOPE="$SCOPE. You may run the project's tests/build to verify"
-  TEXT="You are doing an adversarial code review. Review $SCOPE. ${PROMPT:-Be adversarial: bugs, regressions, missed edge cases. Rank by severity.} Report concrete problems with file and line: logic errors, regressions, and edge cases that would crash or return wrong results (empty inputs, missing keys, None, division by zero, off-by-one) even if no current caller triggers them. Do not report style or speculation."
-  if [[ $JSON -eq 1 ]]; then
-    TEXT="$TEXT An empty findings array is correct when there is nothing concrete. Fill coverage truthfully: files_read lists only repo-relative paths you actually opened; commands_run lists commands you actually ran; tests_run and test_result describe tests you actually ran (use 'not run' otherwise). Set confidence to low if you did not run tests or did not read the changed files fully. Explain the scope and limitations in confidence_reason."
+  # Static prefix first (identical across calls → provider prompt cache), then the packet, then focus.
+  STATIC="You are doing an adversarial code review. Report concrete problems with file and line: logic errors, regressions, and edge cases that would crash or return wrong results (empty inputs, missing keys, None, division by zero, off-by-one) even if no current caller triggers them. Do not report style or speculation."
+  [[ $JSON -eq 1 ]] && STATIC="$STATIC An empty findings array is correct when there is nothing concrete. Fill coverage truthfully: files_read lists only repo-relative paths you actually opened; commands_run lists commands you actually ran; tests_run and test_result describe tests you actually ran (use 'not run' otherwise). Set confidence to low if you did not run tests or did not read the changed files fully. Explain the scope and limitations in confidence_reason."
+  if [[ $PACKET -eq 1 && $RESUME -eq 0 ]]; then
+    PACKET_FILE="$LOG_DIR/$STAMP.packet.md"
+    if ! "$PY" "$HERE/claudex-runs.py" packet "$DIR" "${REVIEW_ARGS[@]}" > "$PACKET_FILE" 2>"$PACKET_FILE.err"; then
+      die "$(cat "$PACKET_FILE.err")"
+    fi
+    rm -f "$PACKET_FILE.err"
+    STATIC="$STATIC
+CONTEXT RULES: everything you need is in the CONTEXT PACKET below (project conventions, test command, changed-file list, full diff, and the post-change contents of every changed file). Do not run discovery commands (ls, find, pwd, rg --files, git status/log, searching for AGENTS.md); do not re-read files that are in the packet. Read a file outside the packet only when a specific finding requires it, and say which and why in confidence_reason. Run the test command if the sandbox allows it."
   fi
-  CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" "$TEXT")
-  (cd "$DIR" && "${CMD[@]}") >"$LOG" 2>&1 </dev/null &
+  FOCUS="Scope: $SCOPE. ${PROMPT:-Be adversarial: bugs, regressions, missed edge cases. Rank by severity.}"
+  if [[ $RESUME -eq 1 ]]; then
+    PREV="$("$PY" "$HERE/claudex-runs.py" last-session "$DIR" review)"; [[ -n "$PREV" ]] || die "no previous review session for $DIR to resume"
+    RESUME_ID="$("$PY" -c 'import json,sys; print(json.loads(sys.argv[1])["session"])' "$PREV")"
+    PREV_LAST="$("$PY" -c 'import json,sys; print(json.loads(sys.argv[1])["log"][:-4]+".last.md")' "$PREV")"
+    export CLAUDEX_RESUMED="$RESUME_ID"
+    CURDIFF="$("$PY" "$HERE/claudex-runs.py" scope-diff "$DIR" "${REVIEW_ARGS[@]}")" || die "could not compute the current diff for the resumed review"
+    TEXT="RE-REVIEW (same session). Since your previous review the working tree changed. Re-check each of your previous findings against the CURRENT DIFF below and classify it: fixed, still open (with line), or changed. Add new findings only for concrete problems introduced by these changes. You already have the files in context; re-read only what the diff touches. Same output format as before.
+
+## Your previous findings
+$(cat "$PREV_LAST" 2>/dev/null | head -c 20000)
+
+## Current diff vs HEAD
+\`\`\`diff
+$(printf '%s' "$CURDIFF" | head -c 120000)
+\`\`\`
+$FOCUS"
+    CMD=(codex exec resume "$RESUME_ID" "${COMMON[@]}" -)
+  else
+    if [[ $PACKET -eq 1 ]]; then
+      TEXT="$STATIC
+
+# CONTEXT PACKET
+$(cat "$PACKET_FILE")
+
+# FOCUS
+$FOCUS"
+    else
+      TEXT="$STATIC Review $SCOPE. $FOCUS"
+    fi
+    CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" -)
+  fi
+  (cd "$DIR" && "${CMD[@]}" <<<"$TEXT") >"$LOG" 2>&1 &
 elif [[ "$MODE" == "build" ]]; then
   COMMON+=(--output-schema "$HERE/build-schema.json")
   TEXT="You are implementing a change in this repository. Work only inside $DIR. Do not commit, do not touch .git, do not create branches. Follow the spec exactly; if something is ambiguous choose the simplest reasonable option and state the assumption. Run the project's tests/build if they exist and fix failures you introduced. Your final message must be JSON matching the supplied build schema: summary, files_changed (path, change: added|modified|deleted|renamed, why), commands_run, tests_run, test_result, assumptions, left_undone, and needs_attention (things the orchestrator must check). Report commands and results truthfully.
 
 SPEC:
 $PROMPT"
-  CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" -)
-  reserve_builder
-  "${CMD[@]}" <<<"$TEXT" >"$LOG" 2>&1 &
+  if [[ $RESUME -eq 1 ]]; then
+    PREV="$("$PY" "$HERE/claudex-runs.py" last-session "$DIR" build)"; [[ -n "$PREV" ]] || die "no previous build session for $DIR to resume"
+    RESUME_ID="$("$PY" -c 'import json,sys; print(json.loads(sys.argv[1])["session"])' "$PREV")"
+    export CLAUDEX_RESUMED="$RESUME_ID"
+    TEXT="FOLLOW-UP (same build session, same directory and rules as before). Address the following, then re-run the relevant tests and report with the same JSON build schema:
+
+$PROMPT"
+    CMD=(codex exec resume "$RESUME_ID" "${COMMON[@]}" -)
+    reserve_builder
+    (cd "$DIR" && "${CMD[@]}" <<<"$TEXT") >"$LOG" 2>&1 &
+  else
+    CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" -)
+    reserve_builder
+    "${CMD[@]}" <<<"$TEXT" >"$LOG" 2>&1 &
+  fi
 else
   CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" -)
   "${CMD[@]}" <<<"$PROMPT" >"$LOG" 2>&1 &
@@ -313,6 +381,7 @@ while kill -0 "$PID" 2>/dev/null; do
 done
 wait "$PID"; RC=$?
 TOKENS="$(tr -d '\r' < "$LOG" | awk '/^tokens used$/{getline; gsub(/,/,""); print; exit}')"; TOKENS="${TOKENS:-0}"
+export CLAUDEX_SESSION="$(tr -d '\r' < "$LOG" | sed -n 's/^session id: //p' | head -1)"
 DUR=$(( $(date +%s) - T0 ))
 if grep "\"id\": *\"$STAMP\"" "$RUNS" 2>/dev/null | grep -q '"status": *"cancelled"'; then
   echo "claudex: cancelled after ${DUR}s" >&2; echo "[claudex log: $LOG]" >&2; exit 130
@@ -321,9 +390,9 @@ fi
 COVERAGE_ARGS=()
 if [[ "$MODE" == review || "$MODE" == build ]]; then
   VALUES="$(coverage "$LOG")" || die "could not measure coverage"
-  read -r EXEC_COUNT TESTS_DETECTED EXECUTED PATCHED <<<"$VALUES"
+  read -r EXEC_COUNT TESTS_DETECTED EXECUTED PATCHED DISCOVERY <<<"$VALUES"; export CLAUDEX_DISCOVERY="$DISCOVERY"
   COVERAGE_ARGS=("$EXEC_COUNT" "$TESTS_DETECTED" "$EXECUTED" "$PATCHED")
-  COVERAGE_LINE="[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED executed=$EXECUTED patched=$PATCHED]"
+  COVERAGE_LINE="[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED executed=$EXECUTED patched=$PATCHED discovery=$DISCOVERY]"
   [[ "$MODE" == review && "$PATCHED" -gt 0 ]] && echo "claudex: WARNING: review transcript contains patches to $PATCHED distinct path(s)" >&2
 fi
 
