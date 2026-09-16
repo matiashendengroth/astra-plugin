@@ -5,6 +5,7 @@
 #   echo "prompt" | claudex [opts]          prompt from stdin
 #   claudex review [opts] [--uncommitted|--base BR|--commit SHA] ["focus"]
 #   claudex status [-C DIR]               running/recent runs and build worktrees
+#   claudex merge [-C DIR]                merge managed build worktrees
 #   claudex budget [-C DIR]               completed run minutes used/limit in the last 24h
 #   claudex ack [-C DIR]                  acknowledge the current changes without a review
 #   claudex cancel [-C DIR] [--keep-worktrees]   stop everything, clean up worktrees
@@ -33,7 +34,7 @@ PY="$(command -v python3 || command -v python)"; [[ -n "$PY" ]] || die "Python 3
 # Read only transcript tool blocks; mentions in answers/tool output are not commands.
 coverage() {
   "$PY" - "$1" <<'PY'
-import re, sys
+import re, shlex, sys
 with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
     lines = f.read().replace("\r", "").splitlines()
 # Codex transcript framing: an "exec" header is followed by "<command> in <cwd>" (command may span
@@ -51,7 +52,29 @@ def command_runs_tests(cmd):
         seg = re.sub(r"^(?:cd\s+\S+\s*)$", "", seg).strip().lstrip("(").strip()
         if RUNNER.match(seg): return True
     return False
-exec_count = 0; tests_detected = False; paths = set()
+def command_executes(cmd):
+    # Unwrap the shell used by Codex, then inspect command segments, never tool output.
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        words = []
+    if words and words[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh"):
+        for i, word in enumerate(words[1:], 1):
+            if word.startswith("-") and "c" in word and i + 1 < len(words):
+                script = words[i + 1]
+                # bash -c './script.sh' (also accepts an explicit sh/bash script).
+                if words[0].rsplit("/", 1)[-1] in ("bash", "sh") and re.match(
+                    r"^(?:(?:bash|sh)\s+(?!-)\S+|(?:\./|[\w.-]+/)[^\s;|&]+|[^\s;|&]+\.(?:sh|bash|py|js|ts|rb|php))(?:\s|$)", script):
+                    return True
+                if command_executes(script): return True
+    runner = re.compile(r"^(?:python3?|node|deno|bun|ruby|php)(?:\s|$)|^(?:go\s+run|cargo\s+run|npx\s+(?:tsx|ts-node)|ts-node)(?:\s|$)")
+    for segment in re.split(r"\s*(?:;|&&|\|\||\||\n)\s*", cmd):
+        segment = segment.strip().lstrip("(").strip()
+        if runner.match(segment): return True
+        if segment != cmd.strip() and re.match(r"^(?:\S*/)?(?:bash|sh)\s", segment):
+            if command_executes(segment): return True
+    return False
+exec_count = 0; tests_detected = False; executed = False; paths = set()
 i = 0
 while i < len(lines):
     line = lines[i]
@@ -67,6 +90,7 @@ while i < len(lines):
             exec_count += 1
             text = "\n".join(cmd); text = CMD_END.sub("", text, count=1) if len(cmd) == 1 else re.sub(CMD_END, "", text)
             tests_detected |= command_runs_tests(text)
+            executed |= command_executes(text)
             i = j + 1; continue
         i += 1; continue
     if line == "apply patch":
@@ -87,7 +111,7 @@ while i < len(lines):
             i = j + 1; continue
         i += 1; continue
     i += 1
-print(exec_count, "yes" if tests_detected else "no", len(paths))
+print(exec_count, "yes" if tests_detected else "no", "yes" if executed else "no", len(paths))
 PY
 }
 
@@ -95,8 +119,8 @@ PY
 if [[ "${1:-}" == coverage ]]; then
   [[ $# -eq 2 && -f "$2" ]] || die "usage: claudex coverage <logfile>"
   VALUES="$(coverage "$2")" || exit $?
-  read -r EXEC_COUNT TESTS_DETECTED PATCHED <<<"$VALUES"
-  echo "[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED patched=$PATCHED]"
+  read -r EXEC_COUNT TESTS_DETECTED EXECUTED PATCHED <<<"$VALUES"
+  echo "[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED executed=$EXECUTED patched=$PATCHED]"
   exit 0
 fi
 
@@ -106,7 +130,7 @@ TIMEOUT=""
 
 case "${1:-}" in
   review|build) MODE="$1"; shift ;;
-  status|cancel|budget|ack)  # local commands also work without Codex installed
+  status|cancel|budget|ack|merge)  # local commands also work without Codex installed
     SUB="$1"; shift; SDIR="$PWD"; EXTRA=()
     while [[ $# -gt 0 ]]; do case "$1" in -C) SDIR="$2"; shift 2 ;; *) EXTRA+=("$1"); shift ;; esac; done
     exec "$PY" "$HERE/claudex-runs.py" "$SUB" "$SDIR" "${EXTRA[@]+"${EXTRA[@]}"}" ;;
@@ -209,12 +233,12 @@ PY
 }
 TOKEN="$("$PY" -c 'import secrets; print(secrets.token_hex(16))')"
 TITLE="$(printf '%s' "${PROMPT:-review}" | head -1)"
-record() {  # record <status> [duration [tokens rc [exec_count tests_detected patched]]]
+record() {  # record <status> [duration [tokens rc [exec_count tests_detected executed patched]]]
   "$PY" - "$STAMP" "$1" "$MODE" "$EFFORT" "$SANDBOX" "$DIR" "$LOG" \
-    "$$" "${PID:-0}" "$TITLE" "$TOKEN" "${PSTART:-}" "${WSTART:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${REVIEW_SCOPE:-}" "${REVIEW_FINGERPRINT:-}" >> "$RUNS" <<'PY'
+    "$$" "${PID:-0}" "$TITLE" "$TOKEN" "${PSTART:-}" "${WSTART:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${REVIEW_SCOPE:-}" "${REVIEW_FINGERPRINT:-}" >> "$RUNS" <<'PY'
 import json, os, sys, time
-ident, status, mode, effort, sandbox, directory, log, wpid, pid, title, token, pstart, wstart, duration, tokens, rc, exec_count, tests_detected, patched, scope, fingerprint = sys.argv[1:]
-event = dict(id=ident, ts=int(time.time()), status=status, mode=mode, effort=effort,
+ident, status, mode, effort, sandbox, directory, log, wpid, pid, title, token, pstart, wstart, duration, tokens, rc, exec_count, tests_detected, executed, patched, scope, fingerprint = sys.argv[1:]
+event = dict(id=ident, ts=time.time(), status=status, mode=mode, effort=effort,
              sandbox=sandbox, dir=os.path.realpath(directory), log=log, wpid=int(wpid), pid=int(pid), command="codex",
              title=title[:160], token=token, pstart=pstart.strip(), wstart=wstart.strip())
 if mode == "review" and status == "done":
@@ -224,7 +248,7 @@ for key, value in (("duration", duration), ("tokens", tokens), ("rc", rc)):
         try: event[key] = int(value)
         except ValueError: event[key] = 0
 if exec_count:
-    event.update(exec_count=int(exec_count), tests_detected=tests_detected == "yes", patched=int(patched))
+    event.update(exec_count=int(exec_count), tests_detected=tests_detected == "yes", executed=executed == "yes", patched=int(patched))
 print(json.dumps(event, separators=(",", ":")))
 PY
 }
@@ -237,29 +261,22 @@ if [[ "$MODE" == "review" ]]; then
   [[ ${#REVIEW_ARGS[@]} -eq 0 ]] && REVIEW_ARGS=(--uncommitted)
   REVIEW_SCOPE="${REVIEW_ARGS[0]#--}"
   REVIEW_FINGERPRINT="$("$PY" "$HERE/claudex-runs.py" fingerprint "$DIR")" || die "could not fingerprint review directory"
-  if [[ -n "$PROMPT" || $JSON -eq 1 ]]; then
-    # a custom prompt cannot be combined with scope flags; fold the scope into the text
-    case "${REVIEW_ARGS[0]}" in
-      --uncommitted) SCOPE="the uncommitted changes (staged, unstaged and untracked; see git status / git diff HEAD)" ;;
-      --base) SCOPE="the changes on this branch relative to base branch ${REVIEW_ARGS[1]} (git diff ${REVIEW_ARGS[1]}...HEAD)" ;;
-      --commit) SCOPE="the changes introduced by commit ${REVIEW_ARGS[1]} (git show ${REVIEW_ARGS[1]})" ;;
-    esac
-    SCOPE="$SCOPE. Ignore .claude/claudex-logs/"
-    [[ "$SANDBOX" != "read-only" ]] && SCOPE="$SCOPE. You may run the project's tests/build to verify"
-    TEXT="Review $SCOPE. ${PROMPT:-Be adversarial: bugs, regressions, missed edge cases. Rank by severity.}"
-    if [[ $JSON -eq 1 ]]; then
-      # `codex exec review` ignores --output-schema, so structured reviews go through plain exec.
-      TEXT="You are doing an adversarial code review. $TEXT Report concrete problems with file and line: logic errors, regressions, and edge cases that would crash or return wrong results (empty inputs, missing keys, None, division by zero, off-by-one) even if no current caller triggers them. Do not report style or speculation. An empty findings array is correct when there is nothing concrete. Fill coverage truthfully: files_read lists only repo-relative paths you actually opened; commands_run lists commands you actually ran; tests_run and test_result describe tests you actually ran (use 'not run' otherwise). Set confidence to low if you did not run tests or did not read the changed files fully. Explain the scope and limitations in confidence_reason."
-      CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" "$TEXT")
-    else
-      CMD=(codex exec -s "$SANDBOX" review "${COMMON[@]}" "$TEXT")
-    fi
-  else
-    CMD=(codex exec -s "$SANDBOX" review "${COMMON[@]}" "${REVIEW_ARGS[@]}")
+  case "${REVIEW_ARGS[0]}" in
+    --uncommitted) SCOPE="the uncommitted changes (staged, unstaged and untracked; see git status / git diff HEAD)" ;;
+    --base) SCOPE="the changes on this branch relative to base branch ${REVIEW_ARGS[1]} (git diff ${REVIEW_ARGS[1]}...HEAD)" ;;
+    --commit) SCOPE="the changes introduced by commit ${REVIEW_ARGS[1]} (git show ${REVIEW_ARGS[1]})" ;;
+  esac
+  SCOPE="$SCOPE. Ignore .claude/claudex-logs/"
+  [[ "$SANDBOX" != "read-only" ]] && SCOPE="$SCOPE. You may run the project's tests/build to verify"
+  TEXT="You are doing an adversarial code review. Review $SCOPE. ${PROMPT:-Be adversarial: bugs, regressions, missed edge cases. Rank by severity.} Report concrete problems with file and line: logic errors, regressions, and edge cases that would crash or return wrong results (empty inputs, missing keys, None, division by zero, off-by-one) even if no current caller triggers them. Do not report style or speculation."
+  if [[ $JSON -eq 1 ]]; then
+    TEXT="$TEXT An empty findings array is correct when there is nothing concrete. Fill coverage truthfully: files_read lists only repo-relative paths you actually opened; commands_run lists commands you actually ran; tests_run and test_result describe tests you actually ran (use 'not run' otherwise). Set confidence to low if you did not run tests or did not read the changed files fully. Explain the scope and limitations in confidence_reason."
   fi
+  CMD=(codex exec "${COMMON[@]}" -C "$DIR" --color never -s "$SANDBOX" "$TEXT")
   (cd "$DIR" && "${CMD[@]}") >"$LOG" 2>&1 </dev/null &
 elif [[ "$MODE" == "build" ]]; then
-  TEXT="You are implementing a change in this repository. Work only inside $DIR. Do not commit, do not touch .git, do not create branches. Follow the spec exactly; if something is ambiguous choose the simplest reasonable option and state the assumption. Run the project's tests/build if they exist and fix failures you introduced. Finish with a short report: files changed (with one line each on what and why), commands you ran and their result, assumptions made, anything left undone.
+  COMMON+=(--output-schema "$HERE/build-schema.json")
+  TEXT="You are implementing a change in this repository. Work only inside $DIR. Do not commit, do not touch .git, do not create branches. Follow the spec exactly; if something is ambiguous choose the simplest reasonable option and state the assumption. Run the project's tests/build if they exist and fix failures you introduced. Your final message must be JSON matching the supplied build schema: summary, files_changed (path, change: added|modified|deleted|renamed, why), commands_run, tests_run, test_result, assumptions, left_undone, and needs_attention (things the orchestrator must check). Report commands and results truthfully.
 
 SPEC:
 $PROMPT"
@@ -297,12 +314,12 @@ if grep "\"id\": *\"$STAMP\"" "$RUNS" 2>/dev/null | grep -q '"status": *"cancell
 fi
 
 COVERAGE_ARGS=()
-if [[ "$MODE" == review ]]; then
-  VALUES="$(coverage "$LOG")" || die "could not measure review coverage"
-  read -r EXEC_COUNT TESTS_DETECTED PATCHED <<<"$VALUES"
-  COVERAGE_ARGS=("$EXEC_COUNT" "$TESTS_DETECTED" "$PATCHED")
-  COVERAGE_LINE="[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED patched=$PATCHED]"
-  [[ "$PATCHED" -gt 0 ]] && echo "claudex: WARNING: review transcript contains patches to $PATCHED distinct path(s)" >&2
+if [[ "$MODE" == review || "$MODE" == build ]]; then
+  VALUES="$(coverage "$LOG")" || die "could not measure coverage"
+  read -r EXEC_COUNT TESTS_DETECTED EXECUTED PATCHED <<<"$VALUES"
+  COVERAGE_ARGS=("$EXEC_COUNT" "$TESTS_DETECTED" "$EXECUTED" "$PATCHED")
+  COVERAGE_LINE="[claudex coverage: exec=$EXEC_COUNT tests=$TESTS_DETECTED executed=$EXECUTED patched=$PATCHED]"
+  [[ "$MODE" == review && "$PATCHED" -gt 0 ]] && echo "claudex: WARNING: review transcript contains patches to $PATCHED distinct path(s)" >&2
 fi
 
 if [[ -s "$OUT" ]]; then
@@ -313,21 +330,21 @@ if [[ -s "$OUT" ]]; then
     tr -d '\r' < "$LOG" | awk '/^tokens used$/{exit} {print}'
     echo "===== CLAUDEX FINAL ANSWER ====="
   fi
-  if [[ "$MODE" == review && $JSON -eq 1 ]]; then
-    "$PY" - "$OUT" "$EXEC_COUNT" "$TESTS_DETECTED" "$PATCHED" "$COVERAGE_LINE" <<'PY'
+  if [[ "$MODE" == build || ( "$MODE" == review && $JSON -eq 1 ) ]]; then
+    "$PY" - "$OUT" "$EXEC_COUNT" "$TESTS_DETECTED" "$EXECUTED" "$PATCHED" "$COVERAGE_LINE" <<'PY'
 import json, sys
-path, exec_count, tests_detected, patched, coverage_line = sys.argv[1:]
+path, exec_count, tests_detected, executed, patched, coverage_line = sys.argv[1:]
 with open(path, encoding="utf-8") as f:
     answer = f.read()
 try:
     result = json.loads(answer)
     if not isinstance(result, dict):
-        raise ValueError("review must be a JSON object")
+        raise ValueError("report must be a JSON object")
 except ValueError:
     print(answer, end="")
     print("\n" + coverage_line)
 else:
-    result["measured"] = dict(exec_count=int(exec_count), tests_detected=tests_detected == "yes", patched=int(patched))
+    result["measured"] = dict(exec_count=int(exec_count), tests_detected=tests_detected == "yes", executed=executed == "yes", patched=int(patched))
     merged = json.dumps(result, indent=2)
     raw = path[:-len(".last.md")] + ".raw.md" if path.endswith(".last.md") else path + ".raw"
     with open(raw, "w", encoding="utf-8") as f: f.write(answer)          # original model answer

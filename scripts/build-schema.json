@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "files_changed", "commands_run", "tests_run", "test_result", "assumptions", "left_undone", "needs_attention"],
+  "properties": {
+    "summary": {"type": "string"},
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "change", "why"],
+        "properties": {
+          "path": {"type": "string"},
+          "change": {"type": "string", "enum": ["added", "modified", "deleted", "renamed"]},
+          "why": {"type": "string"}
+        }
+      }
+    },
+    "commands_run": {"type": "array", "items": {"type": "string"}},
+    "tests_run": {"type": "boolean"},
+    "test_result": {"type": "string"},
+    "assumptions": {"type": "array", "items": {"type": "string"}},
+    "left_undone": {"type": "array", "items": {"type": "string"}},
+    "needs_attention": {"type": "array", "items": {"type": "string"}}
+  }
+}

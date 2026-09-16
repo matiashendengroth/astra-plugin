@@ -2,12 +2,13 @@
 """Shared registry, budget and review-reminder logic. Usage:
    claudex-runs.py status <root>
    claudex-runs.py cancel <root> [--keep-worktrees]
+   claudex-runs.py merge <root>
    claudex-runs.py count-running <root> <mode>
    claudex-runs.py budget <root> [--warn-only]
    claudex-runs.py fingerprint <dir>
    claudex-runs.py ack <root>
 """
-import hashlib, json, os, sys, time, signal, stat, subprocess
+import hashlib, json, math, os, sys, time, signal, stat, subprocess
 
 def registry_root(directory, deadline=None):
     directory = os.path.realpath(directory)
@@ -79,26 +80,54 @@ def normalize_text(data):
     return data
 
 def fingerprint(root, deadline=None, snapshot=None):
+    started = time.monotonic()
     diff, untracked = changes(root, deadline) if snapshot is None else snapshot
     digest = hashlib.sha256(normalize_text(diff) + b"\0")
-    for path in untracked:
+    metadata = []
+    tree = digest.copy()
+    for path in sorted(untracked):
         if deadline is not None and time.monotonic() >= deadline:
-            raise subprocess.TimeoutExpired("fingerprint", 1.5)
+            raise subprocess.TimeoutExpired("fingerprint", 5)
+        info = os.lstat(os.path.join(root, os.fsdecode(path)))
+        stamp = (str(info.st_size) + ":" + str(info.st_mtime_ns)).encode("ascii")
+        metadata.append((path, info, stamp))
+        tree.update(path + b"\0" + stamp + b":" + str(info.st_mode).encode("ascii") + b"\0")
+    # Persist the chosen timed cutoff: scheduling must not change an unchanged tree's
+    # fingerprint. Cache keys include metadata for every path and the tracked diff.
+    cache = os.path.join(root, ".claude", "claudex-logs", ".fingerprint.json")
+    key = tree.hexdigest()
+    try:
+        with open(cache, encoding="utf-8") as f: saved = json.load(f)
+        if saved.get("tree") == key: return saved["fingerprint"]
+    except (OSError, ValueError, KeyError, AttributeError): pass
+    for index, (path, info, stamp) in enumerate(metadata):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("fingerprint", 5)
         filename = os.path.join(root, os.fsdecode(path))
-        info = os.lstat(filename)
         digest.update(path + b"\0")
-        if info.st_size > 1024 * 1024 or not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
-            digest.update(b"size:" + str(info.st_size).encode("ascii") + b"\0")
+        if (index >= 300 or time.monotonic() - started >= 1.5 or info.st_size > 1024 * 1024
+                or not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode))):
+            digest.update(b"stat:" + stamp + b"\0")
             continue
         if stat.S_ISLNK(info.st_mode):
             data = os.fsencode(os.readlink(filename))
         else:
             with open(filename, "rb") as f: data = f.read(1024 * 1024 + 1)
-            if len(data) > 1024 * 1024:  # file grew after stat
-                digest.update(b"size:" + str(os.path.getsize(filename)).encode("ascii") + b"\0")
-                continue
-        digest.update(b"sha256:" + hashlib.sha256(normalize_text(data)).hexdigest().encode("ascii") + b"\0")
-    return digest.hexdigest()
+        if len(data) > 1024 * 1024 or time.monotonic() - started >= 1.5:
+            digest.update(b"stat:" + stamp + b"\0")
+        else:
+            digest.update(b"sha256:" + hashlib.sha256(normalize_text(data)).hexdigest().encode("ascii") + b"\0")
+    value = digest.hexdigest()
+    temporary = cache + "." + str(os.getpid())
+    try:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(dict(tree=key, fingerprint=value), f)
+        os.replace(temporary, cache)
+    except OSError:
+        try: os.unlink(temporary)
+        except OSError: pass
+    return value
 
 def acknowledge(root, value=None):
     value = fingerprint(root) if value is None else value
@@ -107,7 +136,7 @@ def acknowledge(root, value=None):
     with open(path, "w", encoding="utf-8") as f: f.write(value + "\n")
 
 def stop_hook(launcher):
-    deadline = time.monotonic() + 1.5
+    deadline = time.monotonic() + 5
     try:
         payload = json.load(sys.stdin)
         if payload.get("stop_hook_active") is True: return
@@ -121,7 +150,8 @@ def stop_hook(launcher):
             with open(os.path.join(root, ".claude", "claudex-logs", ".reviewed"), encoding="utf-8") as f:
                 if value in f.read().splitlines(): return
         except FileNotFoundError: pass
-        runs = load(registry_root(root, deadline))[1]
+        shared_root = registry_root(root, deadline)
+        runs = load(shared_root)[1]
         if any(r["status"] == "done" and r["mode"] == "review"
                and r.get("scope") == "uncommitted" and r["dir"] == root
                and r.get("fingerprint") == value for r in runs.values()):
@@ -131,12 +161,62 @@ def stop_hook(launcher):
         def quote(path):
             if os.name == "nt": path = path.replace("\\", "/")
             return '"' + path.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
+        edits = direct_edits(shared_root, runs)
+        suffix = f": Claude edited {edits} file(s) directly this change set" if edits else ""
+        if time.monotonic() >= deadline: return
         print(json.dumps({"decision": "block", "reason":
             "CLAUDEX: there are uncommitted changes that have not been reviewed. "
             "Run a review (claudex agent 'review: <dir>') and verify its findings, or, "
-            "if the user explicitly wants to skip, run: " + quote(launcher) + " ack -C " + quote(root)}))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+            "if the user explicitly wants to skip, run: " + quote(launcher) + " ack -C " + quote(root) + suffix}))
+    except Exception:
         return  # hooks must be silent and must not obstruct stopping on errors
+
+def guarded_hook(command, launcher):
+    # Buffer all output in a supervisor. This also bounds blocked stdin, filesystem
+    # reads and registry parsing on Windows, where SIGALRM is unavailable.
+    started = time.monotonic()
+    try:
+        result = subprocess.run([sys.executable, os.path.abspath(__file__), command, launcher],
+                                stdin=sys.stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=4.5)
+        if result.returncode == 0 and time.monotonic() - started < 5:
+            sys.stdout.buffer.write(result.stdout)
+    except Exception: pass
+
+def edit_hook():
+    try:
+        deadline = time.monotonic() + 5
+        payload = json.load(sys.stdin)
+        if payload.get("tool_name") not in ("Edit", "Write", "MultiEdit"): return
+        directory = project_path(payload["cwd"], deadline)
+        with open(os.path.join(directory, "CLAUDE.md"), encoding="utf-8") as f:
+            if "claudex-auto:start" not in f.read(): return
+        path = payload["tool_input"]["file_path"]
+        if not isinstance(path, str) or not path: return
+        path = project_path(os.path.join(directory, path), deadline)
+        root = registry_root(directory, deadline)
+        log = os.path.join(root, ".claude", "claudex-logs", "edits.jsonl")
+        if time.monotonic() >= deadline: return
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        append_event(log, dict(ts=time.time(), path=path))
+    except Exception: pass
+
+def direct_edits(root, runs=None):
+    if runs is None: runs = load(root)[1]
+    since = max((r["ts"] for r in runs.values()
+                 if r["status"] == "done" and r["mode"] in ("build", "review")), default=0)
+    paths = set()
+    try:
+        with open(os.path.join(root, ".claude", "claudex-logs", "edits.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                    if (isinstance(event, dict) and type(event.get("ts")) in (int, float)
+                            and event["ts"] > since and isinstance(event.get("path"), str)):
+                        paths.add(event["path"])
+                except ValueError: pass
+    except OSError: pass
+    return len(paths)
 
 def load(root):
     p = os.path.join(root, ".claude", "claudex-logs", "runs.jsonl")
@@ -155,8 +235,9 @@ def load(root):
     for r in runs.values():
         for key in ("mode", "effort", "title", "status", "dir"):
             if not isinstance(r.get(key), str): r[key] = "?"
-        for key in ("duration", "tokens", "ts"):
+        for key in ("duration", "tokens"):
             if type(r.get(key)) is not int: r[key] = 0
+        if type(r.get("ts")) not in (int, float) or (type(r["ts"]) is float and not math.isfinite(r["ts"])): r["ts"] = 0
         try: time.localtime(r["ts"])
         except (OverflowError, OSError, ValueError): r["ts"] = 0
     return p, runs
@@ -227,6 +308,74 @@ def worktrees(root):
         if inside and path != main and w.get("branch", "").startswith("claudex/"): managed.append(w)
     return managed
 
+def merge(root):
+    def git(directory, *args, check=True):
+        return subprocess.run(["git", "-C", directory, *args], capture_output=True,
+                              check=check)
+    def paths(output):
+        return {os.fsdecode(path) for path in output.split(b"\0") if path}
+    def display(files):
+        return ", ".join(json.dumps(path, ensure_ascii=False) for path in sorted(files)) or "none"
+    try:
+        if git(root, "status", "--porcelain", "--untracked-files=all").stdout:
+            print("claudex: merge refused: current tree is dirty", file=sys.stderr)
+            return 2
+        managed = sorted(worktrees(root), key=lambda w: w["branch"])
+        # Finish all builder commits before comparing or merging any branches.
+        for worktree in managed:
+            added = git(worktree["path"], "add", "-A", "--", ".", ":!.claude/claudex-logs", check=False)
+            if added.returncode:
+                # Some Git versions complain about an ignored .claude parent in
+                # the exclusion even after staging all intended changes. Accept
+                # that only when no eligible unstaged/untracked files remain.
+                pending = git(worktree["path"], "diff", "--quiet", "--", ".", ":!.claude/claudex-logs", check=False)
+                untracked = git(worktree["path"], "ls-files", "--others", "--exclude-standard", "-z",
+                                "--", ".", ":!.claude/claudex-logs").stdout
+                if pending.returncode or untracked:
+                    raise subprocess.CalledProcessError(added.returncode, added.args, stderr=added.stderr)
+            staged = git(worktree["path"], "diff", "--cached", "--quiet", check=False)
+            if staged.returncode == 1:
+                git(worktree["path"], "commit", "-m", "claudex: " + worktree["branch"])
+            elif staged.returncode:
+                raise subprocess.CalledProcessError(staged.returncode, staged.args, stderr=staged.stderr)
+        overlaps = []
+        for index, left in enumerate(managed):
+            for right in managed[index + 1:]:
+                base = git(root, "merge-base", left["branch"], right["branch"]).stdout.decode().strip()
+                changed = [paths(git(root, "diff", "--name-only", "--no-renames", "-z", base, w["branch"], "--").stdout)
+                           for w in (left, right)]
+                overlaps.append((left["branch"], right["branch"], changed[0] & changed[1]))
+        merged, conflicts = [], []
+        for worktree in managed:
+            branch = worktree["branch"]
+            result = git(root, "merge", "--no-ff", "--no-edit", branch, check=False)
+            if result.returncode:
+                files = paths(git(root, "diff", "--name-only", "--diff-filter=U", "-z").stdout)
+                # A non-conflict Git error must not be reported as a successful merge.
+                abort = git(root, "merge", "--abort", check=False)
+                if not files or abort.returncode:
+                    raise subprocess.CalledProcessError(result.returncode, result.args, stderr=result.stderr)
+                conflicts.append((branch, files))
+                continue
+            merged.append(branch)
+            git(root, "worktree", "remove", worktree["path"])
+            git(root, "branch", "-d", branch)
+        print("Merged branches:")
+        for branch in merged: print("  MERGED " + branch)
+        if not merged: print("  none")
+        print("Conflicting branches:")
+        for branch, files in conflicts: print("  CONFLICT " + branch + ": " + display(files))
+        if not conflicts: print("  none")
+        print("Overlap table:")
+        print("  Branch A | Branch B | Files")
+        for left, right, files in overlaps: print(f"  {left} | {right} | {display(files)}")
+        if not overlaps: print("  none")
+        return 4 if conflicts else 0
+    except (OSError, subprocess.SubprocessError) as error:
+        detail = getattr(error, "stderr", None)
+        print("claudex: merge failed: " + (os.fsdecode(detail).strip() if detail else str(error)), file=sys.stderr)
+        return 2
+
 def status(root):
     budget(root, warn_only=True)
     p, runs = load(root)
@@ -238,6 +387,7 @@ def status(root):
     stale   = [r for r in runs.values() if r.get("status") == "running" and not alive(r.get("pid"))]
     done    = sorted([r for r in runs.values() if r.get("status") not in ("running",)], key=lambda r: r["ts"], reverse=True)[:10]
     print(f"CLAUDEX status for {root}")
+    print(f"Direct edits by Claude since last build/review: {direct_edits(root, runs)} files")
     print(f"\nRunning ({len(running)}):")
     for r in running:
         rel = os.path.relpath(r["dir"], root) if r["dir"].startswith(root) else r["dir"]
@@ -305,12 +455,16 @@ def cancel(root, keep):
 
 if __name__ == "__main__":
     cmd, directory = sys.argv[1:3]
-    if cmd == "stop-hook": stop_hook(directory)
+    if cmd == "guard-stop-hook": guarded_hook("stop-hook", directory)
+    elif cmd == "guard-edit-hook": guarded_hook("edit-hook", directory)
+    elif cmd == "edit-hook": edit_hook()
+    elif cmd == "stop-hook": stop_hook(directory)
     elif cmd == "fingerprint": print(fingerprint(os.path.realpath(directory)))
     elif cmd == "ack": acknowledge(os.path.realpath(directory))
     else:
         root = registry_root(directory)
-        if cmd == "status": status(root)
+        if cmd == "merge": sys.exit(merge(root))
+        elif cmd == "status": status(root)
         elif cmd == "cancel": cancel(root, "--keep-worktrees" in sys.argv[3:])
         elif cmd == "count-running": print(count_running(root, sys.argv[3]))
         elif cmd == "max-builders": print(limits(root)["max_builders"])
