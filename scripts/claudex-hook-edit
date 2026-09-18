@@ -2,6 +2,20 @@
 # Measure direct Claude edits without interfering with the tool's result.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-PY="$(command -v python3 || command -v python || true)"
+# Find a Python 3 that actually RUNS. On Windows `python3` is often the Microsoft Store alias:
+# it exists on PATH but only prints "Python was not found" — so existence is not enough.
+find_python() {
+  local c p
+  for c in python3 python; do
+    p="$(command -v "$c" 2>/dev/null)" || continue
+    "$p" -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1 && { printf '%s\n' "$p"; return 0; }
+  done
+  if command -v py >/dev/null 2>&1; then   # Windows py launcher → real interpreter path
+    p="$(py -3 -c 'import sys; print(sys.executable)' 2>/dev/null | tr -d '\r')"
+    [[ -n "$p" ]] && "$p" -c 'import sys' >/dev/null 2>&1 && { printf '%s\n' "$p"; return 0; }
+  fi
+  return 1
+}
+PY="$(find_python || true)"
 [[ -n "$PY" ]] || exit 0
 "$PY" "$HERE/claudex-runs.py" guard-edit-hook unused >/dev/null 2>&1 || true

@@ -10,8 +10,22 @@ DIR="${1:?usage: claudex-setup <project-dir> [on|off]}"; ACTION="${2:-on}"
 DIR="$(cd "$DIR" && pwd -P)"
 LAUNCHER="$HOME/.local/bin/claudex"
 # python: 'python3' on macOS/Linux, usually just 'python' on Windows (Git Bash)
-PY="$(command -v python3 || command -v python || true)"
-[[ -n "$PY" ]] || { echo "claudex-setup: python 3 not found (needed to edit JSON settings). Install from python.org or 'winget install Python.Python.3'" >&2; exit 2; }
+# Find a Python 3 that actually RUNS. On Windows `python3` is often the Microsoft Store alias:
+# it exists on PATH but only prints "Python was not found" — so existence is not enough.
+find_python() {
+  local c p
+  for c in python3 python; do
+    p="$(command -v "$c" 2>/dev/null)" || continue
+    "$p" -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1 && { printf '%s\n' "$p"; return 0; }
+  done
+  if command -v py >/dev/null 2>&1; then   # Windows py launcher → real interpreter path
+    p="$(py -3 -c 'import sys; print(sys.executable)' 2>/dev/null | tr -d '\r')"
+    [[ -n "$p" ]] && "$p" -c 'import sys' >/dev/null 2>&1 && { printf '%s\n' "$p"; return 0; }
+  fi
+  return 1
+}
+PY="$(find_python || true)"
+[[ -n "$PY" ]] || { echo "claudex-setup: Python 3 not found or not runnable. On Windows the 'python3' on PATH is often the Microsoft Store alias; install Python from python.org or run: winget install Python.Python.3.12 (then reopen the terminal)" >&2; exit 2; }
 "$PY" -c 'import sys; sys.exit(0 if sys.version_info[0]==3 else 1)' || { echo "claudex-setup: $PY is not Python 3" >&2; exit 2; }
 CLAUDE_MD="$DIR/CLAUDE.md"; SETTINGS="$DIR/.claude/settings.local.json"; IGNORE="$DIR/.gitignore"
 START='<!-- claudex-auto:start -->'; END='<!-- claudex-auto:end -->'

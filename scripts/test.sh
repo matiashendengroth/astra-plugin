@@ -3,7 +3,21 @@
 # logged-in Codex checks (each is a real Codex session — ~14 calls).
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"; A="$HERE/claudex"
-PY="$(command -v python3 || command -v python)"
+# Find a Python 3 that actually RUNS. On Windows `python3` is often the Microsoft Store alias:
+# it exists on PATH but only prints "Python was not found" — so existence is not enough.
+find_python() {
+  local c p
+  for c in python3 python; do
+    p="$(command -v "$c" 2>/dev/null)" || continue
+    "$p" -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1 && { printf '%s\n' "$p"; return 0; }
+  done
+  if command -v py >/dev/null 2>&1; then   # Windows py launcher → real interpreter path
+    p="$(py -3 -c 'import sys; print(sys.executable)' 2>/dev/null | tr -d '\r')"
+    [[ -n "$p" ]] && "$p" -c 'import sys' >/dev/null 2>&1 && { printf '%s\n' "$p"; return 0; }
+  fi
+  return 1
+}
+PY="$(find_python || true)"
 export PYTHONDONTWRITEBYTECODE=1
 T="$(mktemp -d "$HERE/../.claudex-test.XXXXXX")"; trap 'rm -rf "$T"' EXIT
 T="$(cd "$T" && pwd -P)"
@@ -22,6 +36,7 @@ mkdir -p "$T/stub-bin"
 cat > "$T/stub-bin/codex" <<'SH'
 #!/usr/bin/env bash
 if [[ "${1:-}" == --version ]]; then echo "codex-cli test-version"; exit 0; fi
+if [[ "${STUB_LIMIT:-0}" == 1 ]]; then echo "ERROR: You've hit your usage limit. Upgrade to Pro or try again in 2 hours 5 minutes." >&2; exit 1; fi
 if [[ -n "${STUB_ARGS:-}" ]]; then printf '%s\n' "$@" > "$STUB_ARGS"; fi
 if [[ -n "${STUB_INPUT:-}" ]]; then cat > "$STUB_INPUT"; fi
 while [[ $# -gt 0 ]]; do
@@ -775,12 +790,46 @@ assert result.returncode == 2 and "current tree is dirty" in result.stderr
 assert (project / ".claudex-wt/a").exists() and (project / ".claudex-wt/b").exists()
 assert git(project / ".claudex-wt/a", "status", "--porcelain").stdout  # refused before committing
 manifest = json.loads((here.parent / "hooks/hooks.json").read_text())
-assert manifest["hooks"]["Stop"] == [{"hooks": [{"type": "command", "command": '\"${CLAUDE_PLUGIN_ROOT}/scripts/claudex-hook-stop\"', "timeout": 20}]}]
-assert manifest["hooks"]["PostToolUse"] == [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": '\"${CLAUDE_PLUGIN_ROOT}/scripts/claudex-hook-edit\"', "timeout": 5}]}]
+assert manifest["hooks"]["Stop"] == [{"hooks": [{"type": "command", "command": 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/claudex-hook-stop\"', "timeout": 20}]}]
+assert manifest["hooks"]["PostToolUse"] == [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/claudex-hook-edit\"', "timeout": 5}]}]
 PY
 }
 echo "preflight, budget and Stop hook checks (no network)"
 check "preflight warnings, budget enforcement/accounting and review/ack hook" 'feature_checks'
+echo "usage limit and python resolver checks (no network)"
+limit_checks() {
+  local R="$T/limit-repo" calls="$T/limit-calls" out rc
+  mkdir -p "$R"; ( cd "$R" && git init -q && printf '<!-- claudex-auto:start -->\nrule\n<!-- claudex-auto:end -->\n' > CLAUDE.md && git add -A && git -c user.email=t@t -c user.name=t commit -qm i && echo x > new.py )
+  out="$(STUB_LIMIT=1 PATH="$T/stub-bin:$REAL_PATH" "$A" -C "$R" "hello" 2>&1)"; rc=$?
+  [[ $rc -eq 5 && "$out" == *"usage limit reached"* && "$out" == *"125 min"* ]] || { echo "first call: rc=$rc $out"; return 1; }
+  grep -q '"status":"limited"' "$R/.claude/claudex-logs/runs.jsonl" && ! grep -q '"status":"failed"' "$R/.claude/claudex-logs/runs.jsonl" || { echo "registry"; return 1; }
+  # paused: no codex invocation at all (STUB_STARTED would be appended by the stub)
+  out="$(STUB_STARTED="$calls" PATH="$T/stub-bin:$REAL_PATH" "$A" review -C "$R" 2>&1)"; rc=$?
+  [[ $rc -eq 5 && ! -s "$calls" ]] || { echo "paused call: rc=$rc"; return 1; }
+  # Stop hook fails open with a user-visible message instead of blocking
+  out="$(printf '{"cwd":"%s","stop_hook_active":false}' "$R" | bash "$HERE/claudex-hook-stop")"
+  [[ "$out" == *systemMessage* && "$out" != *'"decision"'* ]] || { echo "hook while limited: $out"; return 1; }
+  [[ "$("$A" status -C "$R")" == *"Codex usage limit"* ]] || { echo "status"; return 1; }
+  [[ "$("$A" limit -C "$R" --clear)" == *cleared* ]] || { echo "clear"; return 1; }
+  out="$(printf '{"cwd":"%s","stop_hook_active":false}' "$R" | bash "$HERE/claudex-hook-stop")"
+  [[ "$out" == *'"decision"'* ]] || { echo "hook after clear: $out"; return 1; }
+  # an ordinary failure is still exit 1, not a limit
+  out="$(STUB_FAIL=1 PATH="$T/stub-bin:$REAL_PATH" "$A" -C "$R" "hello" 2>&1)"; rc=$?
+  [[ $rc -eq 1 && ! -f "$R/.claude/claudex-logs/.limited" ]] || { echo "plain failure: rc=$rc"; return 1; }
+}
+check "usage limit: exit 5, pause without calling codex, hook fails open, clear restores" 'limit_checks'
+python_alias_checks() {
+  # Windows: `python3` on PATH can be the Microsoft Store alias that only prints a hint and fails
+  local F="$T/fake-python"; mkdir -p "$F"
+  printf '#!/usr/bin/env bash\necho "Python was not found; run without arguments to install from the Microsoft Store" >&2\nexit 49\n' > "$F/python3"; chmod +x "$F/python3"
+  ln -sf "$PY" "$F/python"
+  local out; out="$(PATH="$F:/usr/bin:/bin" "$A" status -C "$T" 2>&1)" || { echo "$out"; return 1; }
+  [[ "$out" == *"CLAUDEX status"* ]] || { echo "$out"; return 1; }
+  # nothing runnable at all → a clear message, not a cryptic failure
+  rm -f "$F/python"; out="$(PATH="$F:/bin" "$A" status -C "$T" 2>&1)"; [[ $? -eq 2 && "$out" == *"Microsoft Store alias"* ]] || { echo "no-python: $out"; return 1; }
+}
+check "python resolver skips a non-runnable python3 (Windows Store alias) and explains when none works" 'python_alias_checks'
+
 # Keep live smoke tests isolated from the offline fixtures.
 git -C "$T" worktree remove --force "$T/.claudex-wt/other"
 rmdir "$T/.claudex-wt"
@@ -808,5 +857,6 @@ check "runs.jsonl records done + tokens" 'grep -q "\"status\":\"done\"" "$T/.cla
 check "status lists recent runs"   'o=$("$A" status -C "$T"); [[ "$o" == *"Recent ("* && "$o" == *"done"* ]]'
 check "cancel kills builder + removes worktree" 'git -C "$T" worktree add -q -b claudex/t-1 .claudex-wt/1 HEAD; "$A" build -C "$T/.claudex-wt/1" -e xhigh "Write a 3000 word essay ESSAY.md in 12 sections." >/dev/null 2>&1 & sleep 5; o=$("$A" cancel -C "$T"); wait; [[ "$o" == *"cancelled"* ]] && [[ ! -d "$T/.claudex-wt" ]] && ! git -C "$T" branch | grep -q claudex/t-1'
 check "log rotation keeps <=80 files" '[[ $(ls "$T/.claude/claudex-logs" | wc -l) -le 80 ]]'
+
 
 echo; echo "passed=$pass failed=$fail"; [[ $fail -eq 0 ]]

@@ -22,7 +22,7 @@ Each CLAUDEX run appears as a named agent in Claude Code, and its full Codex tra
 ### Windows notes
 Claude Code runs bash commands through Git Bash, which the scripts target. Make sure:
 - Git for Windows is installed (it ships Git Bash and `awk`, `sed`, `sort`).
-- Python 3 is on PATH: `winget install Python.Python.3`.
+- Python 3 that actually runs. The `python3` that ships on Windows PATH is usually the Microsoft Store alias, which only prints an install hint; CLAUDEX skips it and uses `python` or the `py` launcher. If none works: `winget install Python.Python.3.12`, then reopen the terminal.
 - Codex is installed the same way: `npm i -g @openai/codex`, then `codex` to sign in.
 The launcher installs to `%USERPROFILE%\.local\bin\claudex` and is invoked by its Git Bash path (`/c/Users/<you>/.local/bin/claudex`). Line endings are pinned to LF via `.gitattributes`, so a checkout with `core.autocrlf=true` still works.
 
@@ -78,6 +78,9 @@ See [Writing specs for CLAUDEX builders](docs/SPECS.md) for ownership, shared in
 - **Resume, don't restart.** `--resume` continues the last review or build session for the directory. A re-review after fixes sends only the current diff plus the previous findings and asks for fixed / still open / new; a build follow-up sends the failure to the builder that wrote the code. Measured on a small repo: re-review 2.7k tokens vs 21k cold; build follow-up 4.4k vs 20k.
 - **Discovery is measured.** Coverage reports `discovery`: how many of Codex's commands were exploration (ls, find, git status/log, hunting for AGENTS.md). If it is not near zero, the packet is not doing its job.
 - The offline test suite is the default; `scripts/test.sh --live` runs the Codex-backed checks.
+
+## When Codex runs out of usage
+If Codex refuses a run because of a usage or rate limit, the wrapper exits 5 with a plain message and pauses CLAUDEX for the project until the reset time Codex reported (15 minutes if it gave none). While paused: no Codex calls are made, the orchestrator is told not to retry and to finish the work itself, and the review hook stops blocking — it shows a notice that the change was **not** independently reviewed instead. `claudex status` shows the pause; `claudex limit` prints it; `claudex limit --clear` lifts it early (for example after upgrading your plan).
 
 ## Reasoning effort and timeouts
 

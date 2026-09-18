@@ -117,6 +117,33 @@ def acknowledge(root, value=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f: f.write(value + "\n")
 
+def limit_state(root):
+    """(until_epoch, reason) when a Codex usage-limit pause is active for this project, else None."""
+    path = os.path.join(root, ".claude", "claudex-logs", ".limited")
+    try:
+        with open(path, encoding="utf-8") as f: lines = f.read().splitlines()
+    except OSError: return None
+    data = dict(l.split("=", 1) for l in lines if "=" in l)
+    try: until = int(data.get("until", "0"))
+    except ValueError: return None
+    if until <= time.time():
+        try: os.unlink(path)
+        except OSError: pass
+        return None
+    return until, data.get("reason", "")
+
+def limit_cmd(root, clear):
+    path = os.path.join(root, ".claude", "claudex-logs", ".limited")
+    if clear:
+        try: os.unlink(path); print("claudex: usage-limit pause cleared")
+        except OSError: print("claudex: no usage-limit pause was active")
+        return
+    state = limit_state(root)
+    if not state: print("claudex: no Codex usage-limit pause is active"); return
+    print("claudex: Codex usage limit — paused until %s (%d min). Reason: %s" % (
+        time.strftime("%H:%M", time.localtime(state[0])), max(1, int((state[0] - time.time() + 59) // 60)), state[1]))
+
+
 def stop_hook(launcher):
     deadline = time.monotonic() + 5
     try:
@@ -133,6 +160,12 @@ def stop_hook(launcher):
                 if value in f.read().splitlines(): return
         except FileNotFoundError: pass
         shared_root = registry_root(root, deadline)
+        limited = limit_state(shared_root)
+        if limited:
+            # A review cannot run right now; blocking would trap the session. Say so instead.
+            print(json.dumps({"systemMessage": "CLAUDEX: Codex usage limit reached — these changes were NOT reviewed by Codex (paused until %s)."
+                              % time.strftime("%H:%M", time.localtime(limited[0]))}))
+            return
         runs = load(shared_root)[1]
         if any(r["status"] == "done" and r["mode"] == "review"
                and r.get("scope") == "uncommitted" and r["dir"] == root
@@ -379,6 +412,8 @@ def status(root):
     stale   = [r for r in runs.values() if r.get("status") == "running" and not alive(r.get("pid"))]
     done    = sorted([r for r in runs.values() if r.get("status") not in ("running",)], key=lambda r: r["ts"], reverse=True)[:10]
     print(f"CLAUDEX status for {root}")
+    _lim = limit_state(root)
+    if _lim: print("\n!! Codex usage limit: paused until %s — %s" % (time.strftime("%H:%M", time.localtime(_lim[0])), _lim[1][:120]))
     print(f"Direct edits by Claude since last build/review: {direct_edits(root, runs)} files")
     print(f"\nRunning ({len(running)}):")
     for r in running:
@@ -618,4 +653,5 @@ if __name__ == "__main__":
         elif cmd == "count-running": print(count_running(root, sys.argv[3]))
         elif cmd == "max-builders": print(limits(root)["max_builders"])
         elif cmd == "budget": budget(root, "--warn-only" in sys.argv[3:])
+        elif cmd == "limit": limit_cmd(root, "--clear" in sys.argv[3:])
         else: sys.exit("unknown command")

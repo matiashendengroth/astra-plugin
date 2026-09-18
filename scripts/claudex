@@ -9,6 +9,8 @@
 #   claudex budget [-C DIR]               completed run minutes used/limit in the last 24h
 #   claudex ack [-C DIR]                  acknowledge the current changes without a review
 #   claudex cancel [-C DIR] [--keep-worktrees]   stop everything, clean up worktrees
+#   claudex limit [-C DIR] [--clear]      show (or clear) a Codex usage-limit pause
+# Exit codes: 0 ok · 1 failed · 2 usage · 3 builder budget · 4 merge conflict · 5 Codex usage limit · 124 timeout · 130 cancelled
 #   claudex build [opts] "spec"             implement a spec in DIR (workspace-write, effort default high,
 #                                         timeout default 1200). Prints what it changed.
 #
@@ -33,7 +35,21 @@
 set -uo pipefail
 
 die() { echo "claudex: $*" >&2; exit 2; }
-PY="$(command -v python3 || command -v python)"; [[ -n "$PY" ]] || die "Python 3 required (install python3 or python)"
+# Find a Python 3 that actually RUNS. On Windows `python3` is often the Microsoft Store alias:
+# it exists on PATH but only prints "Python was not found" — so existence is not enough.
+find_python() {
+  local c p
+  for c in python3 python; do
+    p="$(command -v "$c" 2>/dev/null)" || continue
+    "$p" -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1 && { printf '%s\n' "$p"; return 0; }
+  done
+  if command -v py >/dev/null 2>&1; then   # Windows py launcher → real interpreter path
+    p="$(py -3 -c 'import sys; print(sys.executable)' 2>/dev/null | tr -d '\r')"
+    [[ -n "$p" ]] && "$p" -c 'import sys' >/dev/null 2>&1 && { printf '%s\n' "$p"; return 0; }
+  fi
+  return 1
+}
+PY="$(find_python)" || die "Python 3 not found or not runnable. On Windows the 'python3' on PATH is often the Microsoft Store alias; install Python from python.org or run: winget install Python.Python.3.12 (then reopen the terminal)"
 
 # Read only transcript tool blocks; mentions in answers/tool output are not commands.
 coverage() {
@@ -146,7 +162,7 @@ TIMEOUT=""
 
 case "${1:-}" in
   review|build) MODE="$1"; shift ;;
-  status|cancel|budget|ack|merge)  # local commands also work without Codex installed
+  status|cancel|budget|ack|merge|limit)  # local commands also work without Codex installed
     SUB="$1"; shift; SDIR="$PWD"; EXTRA=()
     while [[ $# -gt 0 ]]; do case "$1" in -C) SDIR="$2"; shift 2 ;; *) EXTRA+=("$1"); shift ;; esac; done
     exec "$PY" "$HERE/claudex-runs.py" "$SUB" "$SDIR" "${EXTRA[@]+"${EXTRA[@]}"}" ;;
@@ -216,6 +232,20 @@ if WTS="$(git -C "$DIR" worktree list --porcelain 2>/dev/null)"; then
   [[ -n "$MAIN" ]] && ROOT="$MAIN"
 fi
 RUNS="$ROOT/.claude/claudex-logs/runs.jsonl"; mkdir -p "$(dirname "$RUNS")"
+
+# Codex usage limit: when a previous run hit the limit we pause instead of burning retries.
+LIMIT_FILE="$ROOT/.claude/claudex-logs/.limited"
+limit_message() {  # prints the pause message if a limit is active, else returns 1
+  [[ -f "$LIMIT_FILE" ]] || return 1
+  local until; until="$(sed -n 's/^until=//p' "$LIMIT_FILE" | head -1)"
+  if [[ "$until" =~ ^[0-9]+$ ]] && (( until > $(date +%s) )); then
+    local mins=$(( (until - $(date +%s) + 59) / 60 ))
+    echo "claudex: Codex usage limit reached — paused for about ${mins} min ($(sed -n 's/^reason=//p' "$LIMIT_FILE" | head -1)). Do NOT retry. Continue the task without CLAUDEX and tell the user that Codex review/build was skipped because of the usage limit. To resume early: claudex limit --clear -C \"$ROOT\""
+    return 0
+  fi
+  rm -f "$LIMIT_FILE"; return 1
+}
+if MSG="$(limit_message)"; then echo "$MSG" >&2; exit 5; fi
 "$PY" "$HERE/claudex-runs.py" budget "$ROOT" --warn-only
 BUILDERS_LOCK="$ROOT/.claude/claudex-logs/.builders.lock"; LOCK_HELD=0
 release_builders() {
@@ -431,6 +461,22 @@ PY
   fi
   echo "[claudex log: $LOG | mode=$MODE effort=$EFFORT sandbox=$SANDBOX]"
 else
+  # Did Codex refuse because of a usage/rate limit? Only look at the end of a FAILED run's log.
+  LIMIT_LINE="$(tr -d '\r' < "$LOG" | tail -60 | grep -iE "usage limit|rate limit|rate_limit|insufficient_quota|quota exceeded|too many requests|(^|[^0-9])429([^0-9]|$)|try again in" | tail -1 || true)"
+  if [[ -n "$LIMIT_LINE" ]]; then
+    WAIT="$("$PY" - "$LIMIT_LINE" <<'PYL'
+import re, sys
+t = sys.argv[1].lower(); secs = 0
+for n, unit in re.findall(r"(\d+)\s*(day|hour|hr|minute|min|second|sec)s?", t.split("try again in")[-1] if "try again in" in t else ""):
+    secs += int(n) * {"day": 86400, "hour": 3600, "hr": 3600, "minute": 60, "min": 60, "second": 1, "sec": 1}[unit]
+print(min(max(secs, 0) or 900, 7 * 86400))   # unknown wait → 15 min; never more than a week
+PYL
+)"
+    printf 'until=%s\nreason=%s\n' "$(( $(date +%s) + WAIT ))" "$(printf '%s' "$LIMIT_LINE" | cut -c1-200)" > "$LIMIT_FILE"
+    record limited "$DUR" "$TOKENS" "$RC" "${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"}" 2>/dev/null || true
+    limit_message >&2 || true
+    echo "[claudex log: $LOG]" >&2; exit 5
+  fi
   record failed "$DUR" "$TOKENS" "$RC" "${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"}"
   echo "claudex: no final message produced (exit $RC). Log tail:" >&2; tail -40 "$LOG" >&2; exit 1
 fi

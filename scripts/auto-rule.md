@@ -11,4 +11,5 @@ You are the orchestrator; CLAUDEX is the builder. Builds and reviews go through 
 - Builds need a clean git tree; if it is dirty, ask before starting. Merge commits worktree builds; leave single-chunk results and subsequent verification fixes uncommitted.
 - Before a large build check `WRAPPER budget -C "<dir>"`; if over budget, ask the user before starting more builders.
 - Progress: `WRAPPER status -C "<dir>"` lists running builders and recent runs; tell the user to use `/claudex-status` and `/claudex-cancel` if they ask how to watch or stop it.
+- If a CLAUDEX call exits 5 or says "Codex usage limit reached": do NOT retry and do NOT wait. Do the remaining work yourself, skip the Codex review, and tell the user plainly that Codex was unavailable (usage limit) so the change was not independently reviewed. `WRAPPER limit -C "<dir>"` shows when it resumes.
 <!-- claudex-auto:end -->
